@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Reproduce the README's claims from a clean checkout.
 #
-# Tiered. Tiers 1-4 are cheap, so a reader can check every structural claim --
+# Tiered. Tiers 1-5 are cheap, so a reader can check every structural claim --
 # action space, dof arithmetic, contact masks, the observation contract,
-# determinism -- in a couple of minutes without loading the box. Tier 2 briefly
-# forks three worker processes; that is the heaviest of them. Tier 5 is the CPU
-# benchmark and is the only part that needs the machine to itself.
+# determinism, the PD baseline -- in a few minutes without loading the box.
+# Tier 2 briefly forks three worker processes; that is the heaviest of them.
+# Tier 6 is the CPU benchmark and is the only part that needs the machine to
+# itself.
 set -u
 cd "$(dirname "$0")"
 
@@ -32,27 +33,34 @@ MSG
   exit 1
 fi
 
-hr "1/5  model and repo assumptions -- hand-derived checks"
+hr "1/6  model and repo assumptions -- hand-derived checks"
 # Three silent failure modes live here: a reordered action space, a passive
 # joint shifting qpos, and a contact bitmask that drops the robot through the
 # floor. None of them raise.
 "$PY" test_model.py || exit 1
 
-hr "2/5  environment contract -- 48-dim observation, actions, pushes, vector env"
+hr "2/6  environment contract -- 48-dim observation, actions, pushes, vector env"
 # The quiet failures here are a leaked sim-only observation, an action that
 # saturates against a joint stop, and an index that reads a passive backlash
 # joint on the evaluation model. None of them raise. Forks 3 workers briefly.
 "$PY" test_env.py || exit 1
 
-hr "3/5  what the MJCF contains"
+hr "3/6  what the MJCF contains"
 "$PY" inspect_model.py --all || exit 1
 
-hr "4/5  drop tests -- does the physics behave, does the shipped PD hold"
+hr "4/6  drop tests -- does the physics behave, does the shipped PD hold"
 "$PY" drop_test.py --mode limp --z0 0.25 --seconds 5 || exit 1
 "$PY" drop_test.py --mode hold --seconds 5 || exit 1
 "$PY" drop_test.py --mode hold --variant walk --seconds 5 --no-render || exit 1
 
-hr "5/5  CPU throughput -- the feasibility gate"
+hr "5/6  the PD baseline, and the three risks step 3 inherits"
+# 108.7 +- 2.9 of a 500 ceiling is the number a learned policy has to beat.
+# The diagnostics under it are the reason to read the output rather than just
+# the exit code: three of the four reward penalties are inert, the reward is
+# nearly flat once the robot is down, and OBS_SCALE spans 13x across groups.
+"$PY" baseline.py --seeds 20 || exit 1
+
+hr "6/6  CPU throughput -- the feasibility gate"
 cat <<MSG
 This one loads the machine: up to 8 processes for a few minutes. Close other
 work first. WSL cannot read CPU temperature, so bench.py brackets every
@@ -68,6 +76,13 @@ Short version (about 90 s):
 
 The README's table (about 4 min, box otherwise idle):
     nice -n 10 $PY bench.py --seconds 20 --ref-seconds 10 --tag main
+
+Two measurements the README still reports as open, same conditions:
+    nice -n 10 $PY bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
+    nice -n 10 $PY bench.py --variant groundcontact --seconds 20 --ref-seconds 10 --tag gc
+
+The wrapper-overhead table is single-core and does not load the box:
+    nice -n 10 $PY bench_wrapper.py --seconds 12
 MSG
 if [ -f runs/bench_main.json ]; then
   "$PY" - <<'PY'
