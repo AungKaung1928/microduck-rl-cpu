@@ -204,6 +204,38 @@ def box_is_busy(sample_s=0.4):
     return warn
 
 
+def reference_trend(refs):
+    """Is the reference sequence trending, or just scattering?
+
+    A magnitude check alone cannot tell those apart, and they mean different
+    things. Scatter within a few percent is measurement noise and the rows are
+    comparable. A monotonic run means the machine was in a different state at
+    the start of the sweep than at the end -- recovering from a previous load,
+    or heating into one -- and the rows are not comparable no matter how small
+    the total movement is.
+
+    The run this was written for: 4,172 -> 4,382 -> 4,541 -> 4,534 -> 4,321,
+    three rising points spanning 8.8%, taken 8 s after a four-minute all-core
+    soak. The magnitude check passed it as stable at a 10% bar.
+
+    Returns (length of longest monotonic run, its fractional span, direction).
+    """
+    best = (1, 0.0, "")
+    for direction, cmp in (("rising", lambda a, b: b > a),
+                           ("falling", lambda a, b: b < a)):
+        i = 0
+        while i < len(refs) - 1:
+            j = i
+            while j < len(refs) - 1 and cmp(refs[j], refs[j + 1]):
+                j += 1
+            if j > i:
+                span = abs(refs[j] - refs[i]) / min(refs[i], refs[j])
+                if (j - i + 1, span) > (best[0], best[1]):
+                    best = (j - i + 1, span, direction)
+            i = max(j, i + 1)
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=12.0)
@@ -222,6 +254,11 @@ def main():
                     help="instead of the sweep, hold N processes flat out and "
                          "report the rate per window (what a training run does)")
     ap.add_argument("--windows", type=int, default=12)
+    ap.add_argument("--cooldown", type=float, default=0.0, metavar="SECONDS",
+                    help="wait for the 1-min load average to fall below 1.5 "
+                         "before starting, up to this many seconds. Use it "
+                         "when chaining two benchmarks: the second one "
+                         "otherwise measures the first one's heat.")
     ap.add_argument("--tag", default="", help="suffix for the output filename")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -236,8 +273,27 @@ def main():
     if a.pin and len(a.pin) < max(a.procs):
         raise SystemExit(f"--pin needs at least {max(a.procs)} cores")
 
-    for w in box_is_busy():
+    if a.cooldown > 0:
+        t0 = time.time()
+        while os.getloadavg()[0] > 1.5 and time.time() - t0 < a.cooldown:
+            print(f"  cooling: load average {os.getloadavg()[0]:.2f}, "
+                  f"{a.cooldown - (time.time()-t0):.0f} s of patience left")
+            time.sleep(15.0)
+        # Load average lags by about a minute, so it going quiet means the
+        # processes are gone, not that the package is cool. The reference
+        # windows inside the sweep are what actually detect the difference.
+        print(f"  starting at load average {os.getloadavg()[0]:.2f}")
+
+    startup_warnings = box_is_busy()
+    for w in startup_warnings:
         print(f"  WARNING  {w} -- numbers below are contention, not capability")
+    if startup_warnings:
+        # This is recorded in the JSON, not just printed. A run of 2026-09-10
+        # started 8 s after a four-minute all-core soak, printed exactly this
+        # warning, and wrote a file marked "stable": true, "pass": true with
+        # no trace of it. The file was then read on its own and believed.
+        print("  Let the box idle until the load average is under 1.5 and "
+              "re-run.\n  --cooldown does the waiting.")
 
     if a.sustained:
         n, win = a.sustained, a.seconds
@@ -255,19 +311,33 @@ def main():
         # to the floor. The run of 2026-09-10 read 20,270 against 19,356.
         tail2 = float(np.mean(rates[-2:]))
         decay = tail / peak - 1
-        # Is the curve still falling at the last window? If the final step is
-        # bigger than measurement noise, the floor has not been reached and
-        # more windows are needed before any of this is a budget number.
+        # Has the curve stopped moving at the last window? Movement in either
+        # direction disqualifies it. Falling means the floor has not been
+        # reached. Rising means the machine passed through a dip and is on its
+        # way back, which is not a steady state either -- the groundcontact
+        # run of 2026-09-10 bottomed out at window 11 and then climbed for six
+        # windows, and an earlier version of this check called that settled
+        # because it only looked for a fall.
         last_step = rates[-1] / rates[-2] - 1 if len(rates) > 1 else 0.0
-        settled = last_step > -0.03
+        settled = abs(last_step) < 0.03
+        # A single tail number hides how wide the plateau is. Report the band
+        # over the last third; the budget belongs at its low end, not at a
+        # mean that a lucky window can lift.
+        tail_n = max(2, len(rates) // 3)
+        band = rates[-tail_n:]
+        band_lo, band_hi = min(band), max(band)
         print(f"\n  peak {peak:,.0f}   sustained (last 3 windows) {tail:,.0f}   "
               f"{100*decay:+.1f}%")
         print(f"  last 2 windows {tail2:,.0f}   final window vs previous "
               f"{100*last_step:+.1f}%")
+        print(f"  plateau over the last {tail_n} windows: {band_lo:,.0f} to "
+              f"{band_hi:,.0f}, a {100*(band_hi-band_lo)/band_lo:.0f}% band")
         if not settled:
-            print(f"  Still falling at the last window. {a.windows} windows is "
-                  f"not enough to find the floor;\n  re-run with --windows "
-                  f"{a.windows + 6} before budgeting anything on {tail2:,.0f}.")
+            direction = "falling" if last_step < 0 else "rising"
+            print(f"  Still {direction} at the last window, so this is not a "
+                  f"steady state.\n  {a.windows} windows was not enough; "
+                  f"re-run with --windows {a.windows + 6}.\n  Budget on "
+                  f"{band_lo:,.0f}, the low end of the band, not on a mean.")
         if decay < -0.20:
             print(f"  The box does not hold its peak rate. Budget training on "
                   f"{tail2:,.0f} env-steps/s,\n  not on {peak:,.0f}. WSL cannot "
@@ -281,11 +351,15 @@ def main():
             # sustained JSON found on disk months later could not be matched
             # to a workload or to the machine state it was taken in.
             json.dump({"mode": "sustained", "variant": a.variant,
+                       "startup_warnings": startup_warnings,
+                       "clean": not startup_warnings,
                        "timestamp": datetime.datetime.now().astimezone().isoformat(
                            timespec="seconds"),
                        "procs": n, "window_s": win,
                        "rates": rates, "peak": peak, "sustained": tail,
                        "sustained_last2": tail2, "settled": settled,
+                       "band_windows": tail_n,
+                       "band_low": band_lo, "band_high": band_hi,
                        "decay": decay}, f, indent=2)
         print(f"\n  wrote {out}")
         return
@@ -330,15 +404,30 @@ def main():
               f"{ref:11,.0f} {100*r['ref_drift']:+7.1f}%{flag}")
 
     worst = max(abs(r["ref_drift"]) for r in rows)
+    refs = [ref0] + [r["ref_after"] for r in rows]
+    run_len, run_span, run_dir = reference_trend(refs)
+    trending = run_len >= 3 and run_span > 0.04
     print()
     if worst > 0.10:
         print(f"  UNSTABLE: the 1-process reference moved by up to {100*worst:.0f}% "
               f"across the sweep.\n  Either the box is power-limiting or something "
               f"else used the CPU. Do not quote\n  these numbers; let it idle and "
               f"re-run. Both causes look identical from inside WSL.")
+    elif trending:
+        print(f"  TRENDING: the reference moved {run_dir} across {run_len} "
+              f"consecutive windows,\n  spanning {100*run_span:.1f}%. That is a "
+              f"machine changing state during the sweep, not noise --\n  a "
+              f"{run_dir} reference usually means the box was "
+              + ("recovering from an earlier load.\n" if run_dir == "rising"
+                 else "heating into this one.\n")
+              + f"  The rows are not comparable to each other. Let it idle and "
+                f"re-run.")
     else:
         print(f"  Stable: the 1-process reference held to within "
-              f"{100*worst:.0f}% across the whole sweep.")
+              f"{100*worst:.0f}% across the whole sweep, with no trend.")
+    if startup_warnings:
+        print(f"  Started dirty: {'; '.join(startup_warnings)}. "
+              f"Recorded in the JSON as clean=false.")
 
     best = max(r["env_steps_per_s"] for r in rows)
     print(f"\n  gate: {a.gate:,.0f} env-steps/s   measured: {best:,.0f}   "
@@ -358,7 +447,17 @@ def main():
                    "ref_seconds": ref_seconds, "cores": os.cpu_count(),
                    "pin": a.pin, "ref_before": ref0, "baseline": baseline,
                    "rows": rows,
-                   "worst_ref_drift": worst, "stable": bool(worst <= 0.10),
+                   "worst_ref_drift": worst,
+                   "ref_trend": {"run": run_len, "span": run_span,
+                                 "direction": run_dir},
+                   "trending": bool(trending),
+                   "startup_warnings": startup_warnings,
+                   # `stable` is a conjunction now. It used to be a magnitude
+                   # test alone, which passed a sweep started 8 s after a
+                   # four-minute soak with a reference climbing 8.8%.
+                   "stable": bool(worst <= 0.10 and not trending
+                                  and not startup_warnings),
+                   "clean": not startup_warnings,
                    "gate": a.gate, "pass": bool(best >= a.gate)}, f, indent=2)
     print(f"\n  wrote {out}")
 

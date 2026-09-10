@@ -192,8 +192,25 @@ the variant the task actually uses, same conditions, `runs/bench_gc.json`:
 | 4 | 10,701 | 61% | 21,424 | 82% |
 | 8 | 14,790 | **42%** | 28,749 | 55% |
 
-Gate PASS, 3.0x over. Worst reference drift 8.8%, inside the 10% bar, so the
-rows are comparable to each other.
+Gate PASS, 3.0x over. **These rows were measured on a dirty box and the
+absolute numbers are not quotable.** The run was started eight seconds after
+the four-minute sustained soak above, and `bench.py` said so at the time —
+`WARNING 1-min load average 7.38` — but printed the warning to the terminal
+and wrote a JSON marked `"stable": true` with no trace of it. The file was
+later read on its own and believed.
+
+The contamination is visible in the reference sequence: 4,172 → 4,382 → 4,541
+→ 4,534 → 4,321. Three rising windows spanning 8.8%. That is not scatter, it
+is the machine recovering from the soak *during* the sweep, so the 1-process
+row was taken at the bottom of the recovery and the 8-process row after it.
+The old drift check tested only magnitude against a 10% bar and passed it.
+
+**What survives is the comparison, not the levels.** The efficiency column is
+a ratio of two rows measured minutes apart on the same recovering box, and the
+bias runs against the conclusion: the 1-process baseline was the most
+depressed row, which *overstates* efficiency at 8 processes. Recomputed
+against the recovered reference of 4,541 it is 40.7%, not 42%. Either way it
+is far below `walk`'s 55%, and that gap is the finding.
 
 **Scaling was not a property of the machine alone.** The variant with five
 times the ground-collidable geoms loses efficiency earlier and ends 13 points
@@ -206,58 +223,81 @@ the run was the budget number.
 
 ### The number a training run should be budgeted on
 
-Three measured factors, each a ratio taken inside one harness. That matters
-because the two harnesses disagree on the single-process rate by 13–16%
-(`walk` 6,521 against 7,505, `groundcontact` 4,405 against 5,223 — the sweep
-resets episodes and `bench_wrapper.py` does not). Ratios within a harness
-cancel that bias; a product mixing them would carry it.
+Measured directly, on the variant that gets trained, under the load it gets
+trained at: `--sustained 8 --variant groundcontact --windows 18`,
+`runs/bench_gc_sustained.json`.
 
-| factor | value | from |
+| elapsed | env-steps/s | vs peak |
 |---|---|---|
-| `groundcontact`, 8 processes, 20 s burst | 14,790 | `bench_gc.json` |
-| × sustained derate after four minutes | 0.673 | `bench_sustained.json`, 19,356 / 28,749 |
-| × wrapper cost on `groundcontact` | 0.799 | `bench_wrapper.json`, 4,175 / 5,223 |
+| 20 s | 30,129 | — |
+| 60 s | 23,868 | −21% |
+| 120 s | 21,160 | −30% |
+| 180 s | 18,761 | −38% |
+| 240 s | 15,530 | −48% ← contaminated, see below |
+| 300 s | 15,806 | −48% |
+| 360 s | 17,266 | −43% |
 
-**= ~8,000 env-steps/s.** Composing through `walk` instead — 19,356 sustained,
-times the `groundcontact`/`walk` ratio at 8 processes, times the wrapper —
-gives 7,960. The two agree because they share their factors, not because they
-are independent.
+The shape is not the `walk` shape. `walk` slid monotonically to a floor and
+stayed there. `groundcontact` **undershoots at window 11 and then climbs back
+for six windows**, ending 11% above its minimum and still rising +0.6% at the
+last window. So this is not a steady state either, and eighteen windows found
+the dip rather than the floor.
 
-The upper bound, if `groundcontact` turns out not to derate under sustained
-load the way `walk` does, is 14,790 × 0.799 = **11,800**. So the range is
-**8,000–11,800 and the budget uses the low end.**
+Two disclosures. **Window 11, the global minimum, is contaminated** — a
+10-second two-process benchmark of my own overlapped it, on a box already
+running eight workers, and for a bandwidth-bound variant that is the sensitive
+axis. It is excluded below. And an earlier version of the settled-check in
+`bench.py` called this curve settled, because it only tested for a *fall*; a
+rising tail is equally not a steady state, and it now tests both directions
+and prints the plateau band instead of a single tail number.
 
-This is the third correction to this number and the third in the same
-direction. It was 28,749 when only the sweep existed, 18,400 once the wrapper
-and the variant were measured, and 8,000 once the sweep rows were understood
-to be bursts and the variant was measured at 8 processes rather than one. Each
-revision replaced an assumption with a measurement, and every assumption had
-been the flattering one. **3.6x of optimism, none of it deliberate**, which is
-the argument for the two scripts that now exist rather than for better
-guessing.
+Excluding window 11, the last nine windows run **15,806 to 17,266, a 9% band,
+mean 16,590.** That band is the honest uncertainty, and the budget uses its
+middle rather than its top.
 
-| budget | at ~8,000 (measured) | at ~11,800 (if `groundcontact` does not derate) |
-|---|---|---|
-| 10M (hyperparameter probe) | 21 min | 14 min |
-| 50M (stand + push recovery, expected) | 1.7 h | 1.2 h |
-| 100M (stand, generous) | 3.5 h → 2 chunks | 2.4 h → 2 chunks |
-| 400M (walking gait, upstream-scale) | 14.0 h → 7 chunks | 9.4 h → 5 chunks |
+**One factor is still inherited:** the wrapper, 4,175 / 5,223 = 0.799,
+measured single-core on an idle box. Everything else is now a direct
+measurement of the right workload in the right state.
 
-**The scope conclusion survives; both ends got more expensive.**
-Stand-and-recover at 50M is still one sitting, but at 1.7 h it is close to the
-2 h chunk limit rather than comfortably inside it. Walking at 400M is five to
-seven chunked sessions rather than four. Neither is out of reach, and that was
-the question the gate had to answer.
+**16,590 × 0.799 = ~13,300 env-steps/s.** Range 12,600–13,800 across the band.
 
-One command would close the remaining range by measuring the derate on the
-variant instead of inheriting it from `walk`:
+#### This correction went the other way, and that is the interesting part
 
-```bash
-nice -n 10 python3 bench.py --sustained 8 --variant groundcontact --seconds 20 --windows 18 --tag gc_sustained
-```
+The previous figure was 8,000, and it was too low for two compounding reasons,
+both visible only once this run existed:
 
-Eighteen windows rather than twelve because the `walk` curve was still moving
-−1.0% per window when it ran out of them.
+- The `groundcontact` sweep it was built on read **14,790 at 8 processes —
+  11% *below* this sustained run.** A burst measurement cannot legitimately
+  come in under a sustained one. That is proof, after the fact, that the sweep
+  was measured on a soaked box.
+- That already-depressed number was then multiplied by a 0.673 sustained
+  derate borrowed from `walk`. **The derate was counted twice.**
+
+So the tally for this one number is 28,749 → 18,400 → 8,000 → 13,300. Three
+corrections downward from unmeasured optimism, then one upward from stacking
+two safety factors on the same effect. **Being conservative is not free and it
+is not automatically honest** — an unmeasured pessimistic assumption is the
+same error as an unmeasured optimistic one, and it costs real scope. The fix
+in both directions was identical: measure the thing itself instead of
+composing estimates of its parts.
+
+| budget | at ~13,300 |
+|---|---|
+| 10M (hyperparameter probe) | 13 min |
+| 50M (stand + push recovery, expected) | 1.0 h |
+| 100M (stand, generous) | 2.1 h → 2 chunks |
+| 400M (walking gait, upstream-scale) | 8.4 h → 5 chunks |
+
+**Scope conclusion: stand-and-recover is one comfortable sitting, walking is
+five chunks.** That was the question the gate had to answer, and it survived
+all four revisions of the number, which is the only reason the revisions were
+tolerable.
+
+What would still improve it, in order of value: a re-run with `--windows 30`
+to find whether the climb after window 11 continues or plateaus, and a
+wrapper measurement taken under 8-process load instead of single-core.
+Neither changes the scope conclusion, so neither blocks step 3.
+
 
 ### Why efficiency still falls to 55% at 8 processes, and what I could not determine
 
@@ -635,15 +675,14 @@ Step 3 needs a running observation normaliser rather than a better fixed guess.
 ## Scope, now that the gate has been measured
 
 - **In:** stand and recover from pushes, on `groundcontact`, ~50M env steps.
-  1.7 h at the measured rate, 1.2 h at the optimistic one. One sitting either
-  way, but close enough to the 2 h chunk limit to need a checkpoint.
+  **1.0 h** at the measured rate. One comfortable sitting, checkpointed
+  anyway.
 - **In:** domain randomisation over the four measured actuator classes,
   evaluated on `walk_backlash` as held-out physics.
-- **In, was previously deferred:** a walking gait, 400M steps. 14.0 h at the
-  measured rate, 9.4 h at the optimistic one — five to seven chunks of ≤2 h
-  rather than the 36 h that had put it out of reach. It moved back into scope
-  because the machine was measured properly, not because the plan changed, and
-  it has since moved from four chunks to seven for the same reason.
+- **In, was previously deferred:** a walking gait, 400M steps. **8.4 h,
+  five chunks** of ≤2 h, against the 36 h that had put it out of reach. The
+  estimate moved four times while the scope conclusion never did, which is the
+  only reason the moving was tolerable.
 - **Out:** anything requiring mjlab, MuJoCo Warp, or a GPU.
 
 ## Steps
@@ -665,22 +704,23 @@ Step 3 needs a running observation normaliser rather than a better fixed guess.
   around STAND. A real PPO loop adds policy forward passes, advantage
   computation and optimiser steps on top, so the measured rate is an upper
   bound on the rollout half only, not on training.
-- **The training-rate figure is measured except for one factor.** ~8,000
-  env-steps/s is an 8-process `groundcontact` burst, derated by a
-  sustained-load factor measured on `walk` and by a wrapper cost measured on
-  one core. Only the derate is inherited from a different workload; one
-  command replaces it. Note also that it has never been measured with a
-  policy in the loop — see the first bullet in this list.
-- **The sustained floor is measured, the approach to it barely.** Twelve
-  windows is the least that shows a floor at all: the curve was still moving
-  −1.0% per window at the end, so the true floor may sit a little below
-  19,356. It cannot sit far below — the reduced-power run independently
-  plateaued at 20,152 and held there for eleven windows.
-- **Three of this README's throughput numbers have been wrong, all high.**
-  28,749, then 18,400, then 8,000. Every correction came from measuring
-  something that had been assumed, and every assumption had happened to be the
-  flattering one. Treat a number here as provisional until a script in this
-  repo reproduces it.
+- **The training-rate figure has one inherited factor left.** ~13,300
+  env-steps/s is a directly measured sustained 8-process `groundcontact` rate
+  times a wrapper cost measured single-core on an idle box. It has also never
+  been measured with a policy in the loop — see the first bullet in this
+  list.
+- **Neither sustained run reached a steady state.** `walk` was still falling
+  −1.0% per window after twelve; `groundcontact` bottomed out at window 11 and
+  was still climbing +0.6% after eighteen. The 9% plateau band on the latter
+  is the honest uncertainty on the budget rate, and `--windows 30` is what
+  would close it.
+- **This README's throughput figure has been wrong four times: 28,749,
+  18,400, 8,000, now 13,300.** Three corrections downward from unmeasured
+  optimism and one upward from stacking two derates on the same effect. Treat
+  any number here as provisional until a script in this repo reproduces it,
+  and note that the conservative direction was wrong too — a safety factor
+  applied to a number that already contains it is not caution, it is an
+  error.
 - The 0.79 s fall time is one deterministic rollout from one keyframe. It is a
   baseline to beat, not a distribution. The 108.9 ± 2.8 return is the
   distributional version of it, over 20 seeds, and that is the number step 3
