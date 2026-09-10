@@ -53,17 +53,21 @@ hr "4/5  drop tests -- does the physics behave, does the shipped PD hold"
 "$PY" drop_test.py --mode hold --variant walk --seconds 5 --no-render || exit 1
 
 hr "5/5  CPU throughput -- the feasibility gate"
-cat <<'MSG'
+cat <<MSG
 This one loads the machine: up to 8 processes for a few minutes. Close other
 work first. WSL cannot read CPU temperature, so bench.py brackets every
 configuration with a single-process reference and refuses to call the numbers
 usable if that reference drifts more than 10%.
 
+The interpreter below is the one this script just checked mujoco imports
+under. Do not substitute a bare 'python' -- on many systems that name does
+not exist and nice reports it as a missing file rather than a missing module.
+
 Short version (about 90 s):
-    nice -n 10 python bench.py --seconds 12 --ref-seconds 6 --tag quick
+    nice -n 10 $PY bench.py --seconds 12 --ref-seconds 6 --tag quick
 
 The README's table (about 4 min, box otherwise idle):
-    nice -n 10 python bench.py --seconds 20 --ref-seconds 10 --tag main
+    nice -n 10 $PY bench.py --seconds 20 --ref-seconds 10 --tag main
 MSG
 if [ -f runs/bench_main.json ]; then
   "$PY" - <<'PY'
