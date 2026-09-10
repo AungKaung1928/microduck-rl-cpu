@@ -4,23 +4,23 @@
   "ref_seconds": 4.0,
   "cores": 14,
   "pin": null,
-  "ref_before": 3000.5173929901284,
-  "baseline": 3068.538540469205,
+  "ref_before": 5712.47702958191,
+  "baseline": 6076.902002195186,
   "rows": [
     {
       "procs": 1,
-      "env_steps_per_s": 3068.538540469205,
-      "per_proc": 3068.538540469205,
+      "env_steps_per_s": 6076.902002195186,
+      "per_proc": 6076.902002195186,
       "per_proc_spread": 0.0,
-      "resets": 524,
+      "resets": 1035,
       "speedup": 1.0,
       "efficiency": 1.0,
-      "ref_after": 3033.168603595356,
-      "ref_drift": 0.010881860135691257
+      "ref_after": 6511.703589200146,
+      "ref_drift": 0.13990893188357045
     }
   ],
-  "worst_ref_drift": 0.010881860135691257,
-  "stable": true,
+  "worst_ref_drift": 0.13990893188357045,
+  "stable": false,
   "gate": 5000.0,
-  "pass": false
+  "pass": true
 }

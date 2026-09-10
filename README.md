@@ -16,9 +16,10 @@ fast enough to train a policy at all. Step 2 is the environment contract — wha
 the policy sees, what it emits, when an episode ends — and the baseline it has
 to beat. Steps 3-5 are not started.
 
-Step 1's throughput number no longer reproduces on this machine. That is
-recorded below rather than quietly overwritten, because the cause is outside
-WSL and has not been established.
+Step 1's throughput numbers were re-measured on 2026-09-10 and came back 40%
+higher across 8 processes. The original table had been taken on a machine in a
+reduced-power state that is not visible from inside WSL. Both tables are kept
+below, because the difference between them is the useful part.
 
 ---
 
@@ -38,19 +39,77 @@ and fight each other.
 
 | processes | env-steps/s | per process | speedup | efficiency |
 |---|---|---|---|---|
-| 1 | 6,666 | 6,666 | 1.00x | 100% |
-| 2 | 9,801 | 4,901 | 1.47x | 74% |
-| 4 | 14,275 | 3,569 | 2.14x | 54% |
-| 8 | 20,474 | 2,559 | 3.07x | 38% |
+| 1 | 6,521 | 6,521 | 1.00x | 100% |
+| 2 | 12,555 | 6,278 | 1.93x | 96% |
+| 4 | 21,424 | 5,356 | 3.29x | 82% |
+| 8 | 28,749 | 3,594 | 4.41x | 55% |
 
-**Gate: PASS, 4.1x over.** Eight processes deliver about three times the
-throughput of one, not eight. Scaling is poor and the reason is not visible from
-inside WSL — see below.
+**Gate: PASS, 5.7x over.** The single-process reference window between
+configurations held to within 6% across the whole sweep, so the four rows were
+measured on the same machine as each other. `runs/bench_main.json`.
 
-### The number that actually matters is 28% lower than the peak
+The sweep was run twice, seven minutes apart, and the 8-process row came back
+28,960 and 28,749 — 0.7% apart. `runs/bench_main2.json` is the first of the
+two, kept because a single benchmark is an anecdote. Note that this is much
+tighter than the ±10% run-to-run spread quoted further down, which was measured
+on the machine in its degraded state; on a healthy box the sweep is repeatable
+to about a percent.
 
-The sweep above pauses between configurations. A training run does not. Holding
-8 processes flat out for four minutes:
+### These are the second set of numbers, and the first set is the interesting one
+
+Step 1 originally certified this:
+
+| processes | env-steps/s | efficiency | vs the table above |
+|---|---|---|---|
+| 1 | 6,666 | 100% | +2% |
+| 2 | 9,801 | 74% | −22% |
+| 4 | 14,275 | 54% | −33% |
+| 8 | 20,474 | 38% | −29% |
+
+Same code, same variant, same 8-of-14 thread budget, same laptop on mains
+power. The difference is a host state the guest cannot read.
+
+Read the shape rather than the totals, because the shape is the whole
+diagnosis: **single-process is flat within run-to-run spread, and every
+multi-process row is roughly a third lower.** Thermal throttling decays with
+time under load and would have moved the reference windows within the sweep.
+Another process competing for CPU depresses every row, the single-process one
+included. A sustained all-core power limit does exactly this and nothing else —
+single-core turbo never depended on the all-core budget, every additional core
+did.
+
+The tell that should have caught it at the time is the 2-process row. **Two
+processes on a fourteen-core machine returned 74% efficiency.** There is no
+core-count explanation for that; two workers cannot contend for cores when
+twelve are idle. I read 74% as a property of the chip and built a scaling story
+on top of it, and it was a property of the machine's power state that
+afternoon.
+
+There was a deeper excursion in the same window. While step 2 was being built
+the single-process rate fell to **3,069 env-steps/s**, 46% of certified, with
+the box idle. `bench.py`'s reference bracket called that run stable, and it was
+right to: the tool detects a reference that *moves during a sweep*, and this was
+a machine that was uniformly slow for the whole sweep. Worth naming as a
+limitation of the method — **a drift guard cannot catch a bias that is already
+in place when the first window opens.** The only defence is an absolute
+expectation, which is what the certified table now provides.
+
+Both recovered after a check on the Windows side. **Which setting changed is
+not recorded, and that is the finding rather than a hole in it:** a WSL2 guest
+cannot read power mode, charger wattage, package power or core frequency, so
+host state is unrecoverable after the fact and has to be written down at
+measurement time or lost. The guest-visible substitute is the single-thread
+versus all-core shape above.
+
+**None of this is a reason to push the machine harder.** The thread budget
+stays at 8 of 14.
+
+### What a training run gets is not 28,749
+
+Two separate reasons, and both cut the number.
+
+**First, the sweep pauses and a training run does not.** In the reduced-power
+state, holding 8 processes flat out for four minutes gave:
 
 | elapsed | env-steps/s | vs first window |
 |---|---|---|
@@ -61,66 +120,62 @@ The sweep above pauses between configurations. A training run does not. Holding
 | 180 s | 20,051 | −28% |
 | 240 s | 20,132 | −28% |
 
-The box gives up 28% within the first 40 seconds and then holds **20,184
-env-steps/s within ±3% for the remaining three and a half minutes**. That is a
-short turbo budget followed by a flat sustained-power ceiling, and the flatness
-is the useful part: the sustained rate is stable enough to plan a training run
-against.
+Note what that first window is: **27,905, within 3% of today's 8-process sweep
+row.** So a 20-second window sits inside a turbo budget the machine then spends.
+That test has not been repeated since the recovery, so whether the decay is
+still there is open.
 
-This resolves an ambiguity that has bitten this track before. WSL cannot read
-CPU temperature — `/sys/class/thermal/` has no `thermal_zone*` and
-`/proc/cpuinfo` reports a fixed base clock — so a throughput drop could be
-thermal or it could be another process competing. Here they are separable by
-shape: power limiting appears in the first 40 seconds and then holds flat,
-while contention is erratic. Both were observed. During one sweep the system
-file indexer woke up, the single-process reference moved 16%, and `bench.py`
-refused to certify the numbers.
+**Second, `bench.py` does not measure the thing that gets trained.** Its worker
+is a bare `mj_step` loop on `walk`. The task runs the Python environment
+wrapper on `groundcontact`, and both of those cost:
 
-**Every training budget below uses 20,184 env-steps/s, not 27,905.**
+| single process, 12 s windows | bare `mj_step` | through `MicroduckEnv` | wrapper cost |
+|---|---|---|---|
+| `walk` | 7,414 | 6,028 | 23% |
+| `groundcontact` | 5,091 | 4,505 | **13%** |
 
-| budget | wall clock | plan |
+`runs/bench_wrapper.json`, reproduced by `bench_wrapper.py`. `groundcontact`
+enables ten ground-collidable geoms against `walk`'s two, so it is 31% slower
+before any Python runs.
+
+This corrects an earlier claim in this README that the wrapper cost **0%**,
+measured at 2,771 against 2,776 env-steps/s. That measurement was taken during
+the reduced-power window, where the physics was slow enough to hide a fixed
+Python cost underneath it. On a healthy box the wrapper is visible. 13% is
+still not where optimisation effort should go — the physics is 87% of the step
+— but 0% was wrong, and it was wrong in the flattering direction.
+
+So the rate a training budget should use is the measured single-process wrapped
+rate on `groundcontact` times the measured 8-process speedup:
+**4,505 × 4.41 = ~19,900 env-steps/s.** The assumption inside that product is
+that a scaling factor measured on bare `walk` physics carries to wrapped
+`groundcontact`; it is a projection, not a measurement, and it is flagged as
+one every time it is used below.
+
+| budget | at ~19,900 (projected) | if the −28% decay also returns (~14,300) |
 |---|---|---|
-| 10M steps (hyperparameter probe) | 8 min | one sitting |
-| 50M (stand + push recovery, expected) | 41 min | one sitting |
-| 100M (stand, generous) | 1.4 h | one sitting |
-| 400M (walking gait, upstream-scale) | 5.5 h | 3 chunks of ≤2 h |
+| 10M (hyperparameter probe) | 8 min | 12 min |
+| 50M (stand + push recovery, expected) | 42 min | 58 min |
+| 100M (stand, generous) | 1.4 h | 1.9 h |
+| 400M (walking gait, upstream-scale) | 5.6 h → 3 chunks | 7.8 h → 4 chunks |
 
-So walking is not ruled out by compute. It is ruled out for now by the
-no-overnight-runs rule, which makes it a three-session job rather than an
-impossible one.
+**The scope conclusion is the same at either end of that range**, which is what
+makes the range tolerable: the expected stand-and-recover run is a single
+sitting, and walking is three or four chunked sessions rather than out of
+reach. Two commands close the range, and neither has been run since the
+recovery:
 
-### The same benchmark now returns half that, and I cannot say why from in here
+```bash
+nice -n 10 python3 bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
+nice -n 10 python3 bench.py --variant groundcontact --seconds 20 --ref-seconds 10 --tag gc
+```
 
-Re-run on 2026-09-10 while building step 2, same code, same `walk` variant,
-same thread settings, machine otherwise idle and on mains power:
+### Why efficiency still falls to 55% at 8 processes, and what I could not determine
 
-| | 1-process env-steps/s | gate |
-|---|---|---|
-| step 1, certified | 6,666 | PASS |
-| re-run, 2026-09-10 | 3,069 | **FAIL** |
-
-`bench.py`'s own reference bracket calls this stable — it held to within 1%
-across the re-run, so it is not the drift the tool was built to catch. Load
-average was 0.1, nothing else was on the box, and the two Python processes
-present were idle system daemons. It reproduces across samples and across both
-`walk` and `groundcontact`, which differ from each other by only a few percent.
-
-Two things follow. The budget table above is optimistic by a factor of 2.2 in
-this state: 50M steps is 4.5 h, not 41 minutes, which turns the expected
-stand-and-recover run from one sitting into three chunked sessions. And the
-cause is the same class of question as the core-pinning one — it lives on the
-Windows side, where a guest cannot see power mode, charger wattage, thermal
-state, or a background scan. It is recorded as open rather than guessed at.
-
-**Nothing here is a reason to push the machine harder.** The thread budget
-stays at 8 of 14.
-
-### Why the scaling is bad, and what I could not determine
-
-Efficiency falls to 38% at 8 processes. This chip is an Intel Core Ultra 5 225H:
-14 cores, no hyperthreading, and heterogeneous — a handful of performance cores
-alongside efficiency cores. The obvious hypothesis is that workers 5-8 land on
-slower cores.
+96% at two processes and 82% at four are unremarkable. 55% at eight is not.
+This chip is an Intel Core Ultra 5 225H: 14 cores, no hyperthreading, and
+heterogeneous — a handful of performance cores alongside efficiency cores. The
+obvious hypothesis is that workers 5-8 land on slower cores.
 
 I tried to test it by pinning four workers to CPUs 0-3 and then to CPUs 10-13:
 
@@ -139,9 +194,16 @@ experiment cannot answer the question, and neither can any other experiment run
 from inside the guest. The remaining candidates — shared 18 MB L3, memory
 bandwidth, hypervisor scheduling, sustained power — are not separable from here.
 
+Those two rows predate the recovery described above and have not been repeated;
+their single-process references, 6,129 and 5,769, sit between the degraded and
+recovered rates, so the machine was somewhere in the middle when they were
+taken. The conclusion they support is architectural rather than numeric, so it
+survives, but the numbers themselves should not be quoted.
+
 I am recording this as unresolved rather than picking the plausible-sounding
-answer. What matters operationally is settled anyway: **8 processes is the right
-choice** because it delivers the most total throughput, even at 38% efficiency.
+answer. What matters operationally is settled anyway: **8 processes is the
+right choice**, because it delivers the most total throughput even at 55%
+efficiency.
 
 ---
 
@@ -371,11 +433,19 @@ budget. Env *i* is seeded `seed + i`, and a test asserts that **N workers
 reproduce N sequential envs bit-for-bit** — so a run is reproducible at any
 worker count, and a result cannot quietly depend on how it was parallelised.
 
-Measured single-process, the environment wrapper — observation assembly,
-reward, push scheduling — costs **0%** over a bare `mj_step` loop: 2,771
-against 2,776 env-steps/s. The physics dominates completely, which is the
-expected answer for a 16-body model and worth having as a number rather than an
-assumption.
+Measured single-process on `groundcontact`, the environment wrapper —
+observation assembly, reward, push scheduling, episode bookkeeping — costs
+**13%** over a bare `mj_step` loop doing the same substeps: 4,505 against
+5,091 env-steps/s. The physics is the other 87%, which is the expected answer
+for a 16-body model and worth having as a number rather than an assumption.
+`bench_wrapper.py` measures both halves back to back in one process.
+
+An earlier version of this README reported that cost as 0%, from 2,771 against
+2,776. That was measured while the machine was in the reduced-power state
+described in step 1, where the physics was slow enough to hide a fixed Python
+cost underneath it. Two lessons, both cheap: a ratio is not automatically safe
+from a systematic slowdown, and a number with no run file behind it does not
+get to survive a re-measurement it was never given.
 
 ### What the tests catch that would otherwise be silent
 
@@ -396,13 +466,14 @@ sim-to-sim transfer result meaningless while looking fine.
 ## Scope, now that the gate has been measured
 
 - **In:** stand and recover from pushes, on `groundcontact`, ~50M env steps.
-  41 minutes at step 1's measured rate, 4.5 h at the rate the box currently
-  returns — so budget it as three chunked sessions until that is resolved.
+  42 minutes at the projected training rate, 58 minutes if the sustained decay
+  returns. One sitting either way.
 - **In:** domain randomisation over the four measured actuator classes,
   evaluated on `walk_backlash` as held-out physics.
-- **Deferred, not blocked:** a walking gait. 400M steps was 5.5 h at step 1's
-  rate and is 36 h at the current one, which moves it from three sessions to
-  out of reach. It depends entirely on the throughput question above.
+- **In, was previously deferred:** a walking gait, 400M steps. 5.6 h at the
+  projected rate, 7.8 h at the pessimistic one — three or four chunks of ≤2 h
+  rather than the 36 h that had put it out of reach. It moved back into scope
+  because the machine was measured properly, not because the plan changed.
 - **Out:** anything requiring mjlab, MuJoCo Warp, or a GPU.
 
 ## Steps
@@ -424,10 +495,14 @@ sim-to-sim transfer result meaningless while looking fine.
   around STAND. A real PPO loop adds policy forward passes, advantage
   computation and optimiser steps on top, so the measured rate is an upper
   bound on the rollout half only, not on training.
-- **The throughput figure is unsettled.** Step 1 certified 20,184 env-steps/s
-  across 8 processes; the single-process re-run returns 46% of what it did
-  then. Every wall-clock estimate in this README should be read as a range
-  until that is closed out.
+- **The training-rate figure is a projection, not a measurement.** ~19,900
+  env-steps/s is a single-process wrapped rate on `groundcontact` multiplied by
+  a scaling factor measured on bare `walk` physics. Two commands at the end of
+  step 1 replace it with a measurement; neither has been run.
+- **Sustained behaviour has not been re-measured since the machine recovered.**
+  The four-minute test that produced the −28% decay was run in the
+  reduced-power state. Every wall-clock number here is given as a range for
+  that reason.
 - The 0.79 s fall time is one deterministic rollout from one keyframe. It is a
   baseline to beat, not a distribution. The 108.9 ± 2.8 return is the
   distributional version of it, over 20 seeds, and that is the number step 3
@@ -440,12 +515,19 @@ sim-to-sim transfer result meaningless while looking fine.
   is what step 3 is for.
 - No observation noise, no domain randomisation, no actuator variation. The
   environment runs one nominal physics model. Step 4 adds the spread.
-- Every rate here was measured with a background interactive process consuming
-  about 9% of one core. That is a systematic offset present in all rows
-  equally, so the comparisons hold, but the absolute numbers are a few percent
-  pessimistic.
-- Run-to-run spread on the sweep is roughly ±10%. Two significant figures is all
-  these numbers support.
+- Earlier revisions of this README described every rate as measured against a
+  background process taking about 9% of one core. That figure came from
+  `ps -o pcpu`, which reports CPU time averaged over a process's entire
+  lifetime — a long-lived interactive process that was busy an hour ago and is
+  idle now still reads several percent there. `bench.py` now samples
+  `/proc/<pid>/stat` twice a fraction of a second apart and reports the rate
+  *now*, in percent of one core, warning only above 20% of a core. The
+  certified sweep raised no warning under the corrected check.
+- Run-to-run spread on the certified sweep is about 1% at 8 processes, from
+  two runs seven minutes apart. That is not enough samples to call it a
+  distribution, and it says nothing about spread across days, where the host
+  power state is the dominant term and has already moved these numbers by 40%.
+  Two significant figures is still all any of this supports.
 
 ## Reproducing
 
@@ -464,9 +546,15 @@ pip install -r requirements.txt
 The benchmark is the only part that needs the machine to itself:
 
 ```bash
-nice -n 10 python bench.py --seconds 20 --ref-seconds 10 --tag main
-nice -n 10 python bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
+nice -n 10 python3 bench.py --seconds 20 --ref-seconds 10 --tag main
+nice -n 10 python3 bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
+nice -n 10 python3 bench_wrapper.py --seconds 12        # 1 core, no load
 ```
+
+Use the interpreter the virtual environment above provides. A bare `python` is
+not a command on every system, and `nice` reports a missing interpreter as
+`No such file or directory`, which reads like a missing script. `verify.sh`
+prints the resolved interpreter for this reason.
 
 `bench.py` brackets every configuration with a single-process reference window
 and refuses to certify the table if that reference drifts more than 10%. It also
