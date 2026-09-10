@@ -27,7 +27,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import argparse            # noqa: E402
 import json                # noqa: E402
 import multiprocessing as mp   # noqa: E402
-import subprocess          # noqa: E402
 import time                # noqa: E402
 
 import mujoco              # noqa: E402
@@ -139,24 +138,64 @@ def run(nproc, seconds, variant, pins=None):
     }
 
 
-def box_is_busy():
+def _cpu_ticks():
+    """utime+stime in clock ticks, plus the command name, for every readable pid."""
+    out = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                # comm can contain spaces and parentheses, so split on the last
+                # ") " rather than on whitespace. utime and stime are fields 14
+                # and 15 of the man-page numbering, which is 11 and 12 here.
+                after = f.read().rsplit(") ", 1)[1].split()
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip()
+            out[pid] = (int(after[11]) + int(after[12]), comm)
+        except (OSError, IndexError, ValueError):
+            continue          # process exited between listdir and open
+    return out
+
+
+def box_is_busy(sample_s=0.4):
     """Contention and thermal throttling are indistinguishable from inside WSL,
-    so at least rule out the one that is visible."""
+    so at least rule out the one that is visible.
+
+    This is sampled, not cumulative, and the distinction cost a re-run. An
+    earlier version read `ps -eo pcpu`, which reports CPU time over the entire
+    lifetime of a process. A long-lived interactive process that was busy an
+    hour ago and is idle now still reports several percent there, so every
+    benchmark on this box came with a contention warning describing contention
+    that was not happening, and the numbers were held back as unquotable.
+
+    Two reads of /proc/<pid>/stat a fraction of a second apart give the rate
+    right now instead. Percentages are of ONE core, which is the unit /proc
+    reports in; this machine has 14, so 8% of a core is 0.6% of the machine.
+    The threshold is set at 20% of a core for that reason -- a job that would
+    actually distort a measurement occupies whole cores, not fractions of one.
+    """
     warn = []
-    # Presence of another python process is not contention -- this box always
-    # has two sleeping system daemons. Only CPU time actually being consumed
-    # matters, so filter on %CPU instead of on the process list.
     try:
-        out = subprocess.run(["ps", "-eo", "pid,pcpu,comm", "--no-headers"],
-                             capture_output=True, text=True).stdout.splitlines()
+        hz = os.sysconf("SC_CLK_TCK")
+        before = _cpu_ticks()
+        time.sleep(sample_s)
+        after = _cpu_ticks()
+        me = str(os.getpid())
         busy = []
-        for line in out:
-            pid, pcpu, comm = line.split(None, 2)
-            if int(pid) != os.getpid() and float(pcpu) > 5.0:
-                busy.append(f"{comm.strip()}({pcpu}%)")
+        for pid, (ticks, comm) in after.items():
+            if pid == me or pid not in before:
+                continue
+            pct = 100.0 * (ticks - before[pid][0]) / hz / sample_s
+            if pct > 20.0:
+                busy.append((pct, comm))
+        busy.sort(reverse=True)
         if busy:
-            warn.append("CPU in use by " + ", ".join(busy[:4]))
-    except (OSError, ValueError):
+            share = sum(p for p, _ in busy) / (os.cpu_count() or 1)
+            warn.append("CPU in use by "
+                        + ", ".join(f"{c}({p:.0f}% of a core)" for p, c in busy[:4])
+                        + f" -- {share:.0f}% of the machine")
+    except (OSError, ValueError, ZeroDivisionError):
         pass
     la = os.getloadavg()[0]
     if la > 1.5:
