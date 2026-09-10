@@ -44,6 +44,12 @@ and fight each other.
 | 4 | 21,424 | 5,356 | 3.29x | 82% |
 | 8 | 28,749 | 3,594 | 4.41x | 55% |
 
+**Every row here is a 20-second burst.** The sweep pauses between
+configurations to re-measure its single-process reference, and the package
+cools in those pauses. Held for four minutes the 8-process row falls to 19,356
+and the speedup to 2.97x — see *What a training run gets is not 28,749*. Use
+this table for scaling behaviour, never for a training budget.
+
 **Gate: PASS, 5.7x over.** The single-process reference window between
 configurations held to within 6% across the whole sweep, so the four rows were
 measured on the same machine as each other. `runs/bench_main.json`.
@@ -106,24 +112,49 @@ stays at 8 of 14.
 
 ### What a training run gets is not 28,749
 
-Two separate reasons, and both cut the number.
+Three separate reasons, and all of them cut the number.
 
-**First, the sweep pauses and a training run does not.** In the reduced-power
-state, holding 8 processes flat out for four minutes gave:
+**First, the sweep pauses and a training run does not.** The sweep brackets
+every configuration with a single-process reference window, which lets the
+package cool between measurements. A training run never gets that pause.
+Holding 8 processes flat out for four minutes on the recovered machine:
 
-| elapsed | env-steps/s | vs first window |
+| elapsed | env-steps/s | vs peak |
 |---|---|---|
-| 20 s | 27,905 | — |
-| 40 s | 20,076 | −28% |
-| 60 s | 20,383 | −27% |
-| 120 s | 20,451 | −27% |
-| 180 s | 20,051 | −28% |
-| 240 s | 20,132 | −28% |
+| 20 s | 33,349 | — |
+| 40 s | 30,935 | −7% |
+| 80 s | 29,262 | −12% |
+| 120 s | 27,313 | −18% |
+| 160 s | 25,323 | −24% |
+| 200 s | 23,931 | −28% |
+| 220 s | 19,456 | −42% |
+| 240 s | 19,256 | −42% |
 
-Note what that first window is: **27,905, within 3% of today's 8-process sweep
-row.** So a 20-second window sits inside a turbo budget the machine then spends.
-That test has not been repeated since the recovery, so whether the decay is
-still there is open.
+Monotonic in all twelve windows. The final step is −1.0%, so the curve has
+just about flattened — but only just, and twelve windows is the least that
+shows a floor at all.
+
+The same test in the reduced-power state read 27,905 in its first window and
+then eleven windows at 20,152 ± 287: a 5% spread with no trend. **That is not
+a decay curve, and the −28% this README previously quoted from it was the
+ratio of a flat plateau to one turbo window.** The two runs are worth more
+together than separately:
+
+| | first window | after four minutes |
+|---|---|---|
+| reduced-power state | 27,905 | 20,152 |
+| recovered | 33,349 | 19,356 |
+
+**The floors agree to 3.9%.** The host power state changed how much burst the
+machine had to spend, not where it ended up. Four minutes into an 8-process
+load this box does about 19,400 env-steps/s of bare `walk` physics in either
+state, and that — not 28,749 — is what a training run lives on.
+
+`runs/bench_sustained.json`, reproduced by:
+
+```bash
+nice -n 10 python3 bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
+```
 
 **Second, `bench.py` does not measure the thing that gets trained.** Its worker
 is a bare `mj_step` loop on `walk`. The task runs the Python environment
@@ -151,30 +182,82 @@ during the reduced-power window, where the physics was slow enough to hide a
 fixed Python cost underneath it. On a healthy box the wrapper is visible. 0%
 was wrong, and it was wrong in the flattering direction.
 
-So the rate a training budget should use is the measured single-process wrapped
-rate on `groundcontact` times the measured 8-process speedup:
-**4,175 × 4.41 = ~18,400 env-steps/s.** The assumption inside that product is
-that a scaling factor measured on bare `walk` physics carries to wrapped
-`groundcontact`; it is a projection, not a measurement, and it is flagged as
-one every time it is used below.
+**Third, `groundcontact` does not scale like `walk`.** Running the sweep on
+the variant the task actually uses, same conditions, `runs/bench_gc.json`:
 
-| budget | at ~18,400 (projected) | if the −28% decay also returns (~13,250) |
+| processes | `groundcontact` | efficiency | `walk` | efficiency |
+|---|---|---|---|---|
+| 1 | 4,405 | 100% | 6,521 | 100% |
+| 2 | 7,440 | 84% | 12,555 | 96% |
+| 4 | 10,701 | 61% | 21,424 | 82% |
+| 8 | 14,790 | **42%** | 28,749 | 55% |
+
+Gate PASS, 3.0x over. Worst reference drift 8.8%, inside the 10% bar, so the
+rows are comparable to each other.
+
+**Scaling was not a property of the machine alone.** The variant with five
+times the ground-collidable geoms loses efficiency earlier and ends 13 points
+lower at 8 processes. That is the signature of a shared resource outside the
+core — L3 or memory bandwidth — and against a performance-core/efficiency-core
+split, which would not care how much contact work each process does. It does
+not prove the bandwidth hypothesis, but it is the first evidence for it that
+was obtainable from inside the guest, and it arrived by accident: the point of
+the run was the budget number.
+
+### The number a training run should be budgeted on
+
+Three measured factors, each a ratio taken inside one harness. That matters
+because the two harnesses disagree on the single-process rate by 13–16%
+(`walk` 6,521 against 7,505, `groundcontact` 4,405 against 5,223 — the sweep
+resets episodes and `bench_wrapper.py` does not). Ratios within a harness
+cancel that bias; a product mixing them would carry it.
+
+| factor | value | from |
 |---|---|---|
-| 10M (hyperparameter probe) | 9 min | 13 min |
-| 50M (stand + push recovery, expected) | 45 min | 1.0 h |
-| 100M (stand, generous) | 1.5 h | 2.1 h |
-| 400M (walking gait, upstream-scale) | 6.0 h → 4 chunks | 8.4 h → 5 chunks |
+| `groundcontact`, 8 processes, 20 s burst | 14,790 | `bench_gc.json` |
+| × sustained derate after four minutes | 0.673 | `bench_sustained.json`, 19,356 / 28,749 |
+| × wrapper cost on `groundcontact` | 0.799 | `bench_wrapper.json`, 4,175 / 5,223 |
 
-**The scope conclusion is the same at either end of that range**, which is what
-makes the range tolerable: the expected stand-and-recover run is a single
-sitting, and walking is four or five chunked sessions rather than out of
-reach. Two commands close the range, and neither has been run since the
-recovery:
+**= ~8,000 env-steps/s.** Composing through `walk` instead — 19,356 sustained,
+times the `groundcontact`/`walk` ratio at 8 processes, times the wrapper —
+gives 7,960. The two agree because they share their factors, not because they
+are independent.
+
+The upper bound, if `groundcontact` turns out not to derate under sustained
+load the way `walk` does, is 14,790 × 0.799 = **11,800**. So the range is
+**8,000–11,800 and the budget uses the low end.**
+
+This is the third correction to this number and the third in the same
+direction. It was 28,749 when only the sweep existed, 18,400 once the wrapper
+and the variant were measured, and 8,000 once the sweep rows were understood
+to be bursts and the variant was measured at 8 processes rather than one. Each
+revision replaced an assumption with a measurement, and every assumption had
+been the flattering one. **3.6x of optimism, none of it deliberate**, which is
+the argument for the two scripts that now exist rather than for better
+guessing.
+
+| budget | at ~8,000 (measured) | at ~11,800 (if `groundcontact` does not derate) |
+|---|---|---|
+| 10M (hyperparameter probe) | 21 min | 14 min |
+| 50M (stand + push recovery, expected) | 1.7 h | 1.2 h |
+| 100M (stand, generous) | 3.5 h → 2 chunks | 2.4 h → 2 chunks |
+| 400M (walking gait, upstream-scale) | 14.0 h → 7 chunks | 9.4 h → 5 chunks |
+
+**The scope conclusion survives; both ends got more expensive.**
+Stand-and-recover at 50M is still one sitting, but at 1.7 h it is close to the
+2 h chunk limit rather than comfortably inside it. Walking at 400M is five to
+seven chunked sessions rather than four. Neither is out of reach, and that was
+the question the gate had to answer.
+
+One command would close the remaining range by measuring the derate on the
+variant instead of inheriting it from `walk`:
 
 ```bash
-nice -n 10 python3 bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
-nice -n 10 python3 bench.py --variant groundcontact --seconds 20 --ref-seconds 10 --tag gc
+nice -n 10 python3 bench.py --sustained 8 --variant groundcontact --seconds 20 --windows 18 --tag gc_sustained
 ```
+
+Eighteen windows rather than twelve because the `walk` curve was still moving
+−1.0% per window when it ran out of them.
 
 ### Why efficiency still falls to 55% at 8 processes, and what I could not determine
 
@@ -199,6 +282,15 @@ hypervisor schedules virtual CPUs onto physical cores on its own. So this
 experiment cannot answer the question, and neither can any other experiment run
 from inside the guest. The remaining candidates — shared 18 MB L3, memory
 bandwidth, hypervisor scheduling, sustained power — are not separable from here.
+
+**Pinning was the wrong instrument. Changing the workload worked.** The
+`groundcontact` sweep above loses efficiency earlier than `walk` and ends 13
+points lower at 8 processes, on the same cores in the same session. A
+core-type split cannot produce that: which physical core a process lands on
+does not depend on how much contact solving it does. A shared resource outside
+the core can, and does. That points at L3 and memory bandwidth over the other
+two candidates. It is one comparison between two variants, not a proof, and
+the honest way to test it would be to sweep a variant with more geoms still.
 
 Those two rows predate the recovery described above and have not been repeated;
 their single-process references, 6,129 and 5,769, sit between the degraded and
@@ -543,14 +635,15 @@ Step 3 needs a running observation normaliser rather than a better fixed guess.
 ## Scope, now that the gate has been measured
 
 - **In:** stand and recover from pushes, on `groundcontact`, ~50M env steps.
-  42 minutes at the projected training rate, 58 minutes if the sustained decay
-  returns. One sitting either way.
+  1.7 h at the measured rate, 1.2 h at the optimistic one. One sitting either
+  way, but close enough to the 2 h chunk limit to need a checkpoint.
 - **In:** domain randomisation over the four measured actuator classes,
   evaluated on `walk_backlash` as held-out physics.
-- **In, was previously deferred:** a walking gait, 400M steps. 5.6 h at the
-  projected rate, 7.8 h at the pessimistic one — three or four chunks of ≤2 h
+- **In, was previously deferred:** a walking gait, 400M steps. 14.0 h at the
+  measured rate, 9.4 h at the optimistic one — five to seven chunks of ≤2 h
   rather than the 36 h that had put it out of reach. It moved back into scope
-  because the machine was measured properly, not because the plan changed.
+  because the machine was measured properly, not because the plan changed, and
+  it has since moved from four chunks to seven for the same reason.
 - **Out:** anything requiring mjlab, MuJoCo Warp, or a GPU.
 
 ## Steps
@@ -572,14 +665,22 @@ Step 3 needs a running observation normaliser rather than a better fixed guess.
   around STAND. A real PPO loop adds policy forward passes, advantage
   computation and optimiser steps on top, so the measured rate is an upper
   bound on the rollout half only, not on training.
-- **The training-rate figure is a projection, not a measurement.** ~19,900
-  env-steps/s is a single-process wrapped rate on `groundcontact` multiplied by
-  a scaling factor measured on bare `walk` physics. Two commands at the end of
-  step 1 replace it with a measurement; neither has been run.
-- **Sustained behaviour has not been re-measured since the machine recovered.**
-  The four-minute test that produced the −28% decay was run in the
-  reduced-power state. Every wall-clock number here is given as a range for
-  that reason.
+- **The training-rate figure is measured except for one factor.** ~8,000
+  env-steps/s is an 8-process `groundcontact` burst, derated by a
+  sustained-load factor measured on `walk` and by a wrapper cost measured on
+  one core. Only the derate is inherited from a different workload; one
+  command replaces it. Note also that it has never been measured with a
+  policy in the loop — see the first bullet in this list.
+- **The sustained floor is measured, the approach to it barely.** Twelve
+  windows is the least that shows a floor at all: the curve was still moving
+  −1.0% per window at the end, so the true floor may sit a little below
+  19,356. It cannot sit far below — the reduced-power run independently
+  plateaued at 20,152 and held there for eleven windows.
+- **Three of this README's throughput numbers have been wrong, all high.**
+  28,749, then 18,400, then 8,000. Every correction came from measuring
+  something that had been assumed, and every assumption had happened to be the
+  flattering one. Treat a number here as provisional until a script in this
+  repo reproduces it.
 - The 0.79 s fall time is one deterministic rollout from one keyframe. It is a
   baseline to beat, not a distribution. The 108.9 ± 2.8 return is the
   distributional version of it, over 20 seeds, and that is the number step 3

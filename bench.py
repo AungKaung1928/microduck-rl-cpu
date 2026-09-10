@@ -25,6 +25,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 import argparse            # noqa: E402
+import datetime            # noqa: E402
 import json                # noqa: E402
 import multiprocessing as mp   # noqa: E402
 import time                # noqa: E402
@@ -248,20 +249,43 @@ def main():
         for i, r in enumerate(rates):
             print(f"  {i:7d} {(i+1)*win:8.0f}s {r:13,.0f} {100*(r/peak-1):+8.1f}%")
         tail = float(np.mean(rates[-3:]))
+        # Two tails, because they disagree when the curve has not flattened.
+        # The 3-window mean is the historical metric and it averages in a
+        # window that may still be on the slope; the 2-window mean is closer
+        # to the floor. The run of 2026-09-10 read 20,270 against 19,356.
+        tail2 = float(np.mean(rates[-2:]))
         decay = tail / peak - 1
+        # Is the curve still falling at the last window? If the final step is
+        # bigger than measurement noise, the floor has not been reached and
+        # more windows are needed before any of this is a budget number.
+        last_step = rates[-1] / rates[-2] - 1 if len(rates) > 1 else 0.0
+        settled = last_step > -0.03
         print(f"\n  peak {peak:,.0f}   sustained (last 3 windows) {tail:,.0f}   "
               f"{100*decay:+.1f}%")
+        print(f"  last 2 windows {tail2:,.0f}   final window vs previous "
+              f"{100*last_step:+.1f}%")
+        if not settled:
+            print(f"  Still falling at the last window. {a.windows} windows is "
+                  f"not enough to find the floor;\n  re-run with --windows "
+                  f"{a.windows + 6} before budgeting anything on {tail2:,.0f}.")
         if decay < -0.20:
             print(f"  The box does not hold its peak rate. Budget training on "
-                  f"{tail:,.0f} env-steps/s,\n  not on {peak:,.0f}. WSL cannot "
+                  f"{tail2:,.0f} env-steps/s,\n  not on {peak:,.0f}. WSL cannot "
                   f"read CPU temperature, so this decay curve is the\n  only "
                   f"evidence available that sustained power limiting is real here.")
         else:
             print(f"  The box holds its rate under continuous load.")
         os.makedirs("runs", exist_ok=True)
         with open(out, "w") as f:
-            json.dump({"mode": "sustained", "procs": n, "window_s": win,
+            # variant and timestamp are recorded because they were not, and a
+            # sustained JSON found on disk months later could not be matched
+            # to a workload or to the machine state it was taken in.
+            json.dump({"mode": "sustained", "variant": a.variant,
+                       "timestamp": datetime.datetime.now().astimezone().isoformat(
+                           timespec="seconds"),
+                       "procs": n, "window_s": win,
                        "rates": rates, "peak": peak, "sustained": tail,
+                       "sustained_last2": tail2, "settled": settled,
                        "decay": decay}, f, indent=2)
         print(f"\n  wrote {out}")
         return

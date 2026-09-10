@@ -1,0 +1,59 @@
+{
+  "variant": "groundcontact",
+  "seconds": 20.0,
+  "ref_seconds": 10.0,
+  "cores": 14,
+  "pin": null,
+  "ref_before": 4172.131257842315,
+  "baseline": 4404.5774094364515,
+  "rows": [
+    {
+      "procs": 1,
+      "env_steps_per_s": 4404.5774094364515,
+      "per_proc": 4404.5774094364515,
+      "per_proc_spread": 0.0,
+      "resets": 835,
+      "speedup": 1.0,
+      "efficiency": 1.0,
+      "ref_after": 4381.54763463478,
+      "ref_drift": 0.05019410077255526
+    },
+    {
+      "procs": 2,
+      "env_steps_per_s": 7440.220233141625,
+      "per_proc": 3720.1101165708124,
+      "per_proc_spread": 0.9111447127183965,
+      "resets": 1409,
+      "speedup": 1.6892018328935605,
+      "efficiency": 0.8446009164467803,
+      "ref_after": 4541.262158263458,
+      "ref_drift": 0.08847538047305958
+    },
+    {
+      "procs": 4,
+      "env_steps_per_s": 10701.197429850428,
+      "per_proc": 2675.299357462607,
+      "per_proc_spread": 30.205053831676196,
+      "resets": 2027,
+      "speedup": 2.4295628013992845,
+      "efficiency": 0.6073907003498211,
+      "ref_after": 4533.6072526472235,
+      "ref_drift": 0.08664060943083851
+    },
+    {
+      "procs": 8,
+      "env_steps_per_s": 14789.585222581536,
+      "per_proc": 1848.6981528226922,
+      "per_proc_spread": 23.3256597081604,
+      "resets": 2797,
+      "speedup": 3.3577762059297775,
+      "efficiency": 0.4197220257412222,
+      "ref_after": 4321.0604677401,
+      "ref_drift": 0.035696194748869425
+    }
+  ],
+  "worst_ref_drift": 0.08847538047305958,
+  "stable": true,
+  "gate": 5000.0,
+  "pass": true
+}

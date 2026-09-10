@@ -1,9 +1,10 @@
 """Run N Microducks in N processes, because threads do not help here.
 
 Step 1 measured why: MuJoCo's step for this 16-body model is single-threaded
-and fits in cache, so the only parallelism available is process-level, and it
-tops out at 20,184 env-steps/s across 8 processes on this box. This is the
-piece that turns that number into samples.
+and fits in cache, so the only parallelism available is process-level. Across
+8 processes on this box it bursts to 28,749 env-steps/s of bare `mj_step` and
+settles to 19,356 after four minutes of continuous load; the settled figure is
+the one to plan on. This is the piece that turns it into samples.
 
 Two things this deliberately does not do:
 
