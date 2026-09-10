@@ -1,4 +1,4 @@
-"""How fast can this laptop actually simulate the Microduck?
+"""How fast can this machine actually simulate the Microduck?
 
 This is the feasibility gate for the whole project. Upstream trains on GPU with
 4096 parallel environments; this box has no GPU and an 8-of-14-thread budget.

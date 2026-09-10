@@ -112,6 +112,59 @@ def actuated_qpos_index(model):
     return np.array(idx, dtype=int)
 
 
+def actuated_qvel_index(model):
+    """qvel indices of the 14 actuated joints, in actuator order.
+
+    The qpos twin of this exists because `walk_backlash` interleaves passive
+    joints; qvel has exactly the same problem. On `groundcontact` these are the
+    contiguous 6..19, on `walk_backlash` they are 6, 8, 10 ... 32. Anything
+    reading joint velocity goes through here.
+    """
+    idx = []
+    for name in ACTUATOR_NAMES:
+        j = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if j < 0:
+            raise KeyError(f"joint {name!r} missing from this variant")
+        idx.append(model.jnt_dofadr[j])
+    return np.array(idx, dtype=int)
+
+
+def joint_limits(model):
+    """(lo, hi) arrays of the 14 actuated joint ranges, in actuator order.
+
+    Worth stating plainly because it is a trap: `ctrlrange` on every actuator
+    is [-10, 10] rad, which is not a joint limit and not even reachable. The
+    tightest real limit is the hip roll at +-0.384 rad. A position actuator
+    handed a target of 10 rad does not error -- it just saturates against the
+    joint stop and burns force range. Clamping is the caller's job.
+    """
+    lo, hi = [], []
+    for name in ACTUATOR_NAMES:
+        j = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        lo.append(model.jnt_range[j, 0])
+        hi.append(model.jnt_range[j, 1])
+    return np.array(lo), np.array(hi)
+
+
+def default_pose(model, name="STAND"):
+    """The 14 actuated joint angles at a keyframe, in actuator order.
+
+    Actions are residuals around this, so it is also what `ctrl` is set to when
+    the policy emits zero. On STAND the keyframe's own `ctrl` equals its `qpos`
+    at these joints, so the robot starts commanded to where it already is.
+    """
+    return model.key_qpos[keyframe(model, name)][actuated_qpos_index(model)].copy()
+
+
+def sensor_slice(model, name):
+    """Where a named sensor's values live in `data.sensordata`."""
+    i = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
+    if i < 0:
+        raise KeyError(f"no sensor {name!r}")
+    adr = int(model.sensor_adr[i])
+    return slice(adr, adr + int(model.sensor_dim[i]))
+
+
 def floor_contact_geoms(model):
     """Names of the geoms that can actually touch the floor.
 

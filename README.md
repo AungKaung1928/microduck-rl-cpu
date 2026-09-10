@@ -11,9 +11,14 @@ no hardware to buy. So the whole thing runs the same MJCF in plain CPU MuJoCo,
 parallel across processes, inside an 8-of-14-thread budget on a laptop that
 has other work to do.
 
-**Step 1 is done: the feasibility gate.** It answers one question — is this
-machine fast enough to train a policy at all — and it turned up three things
-about the model that changed the plan for step 2. Steps 2-5 are not started.
+**Steps 1 and 2 are done.** Step 1 is the feasibility gate: is this machine
+fast enough to train a policy at all. Step 2 is the environment contract — what
+the policy sees, what it emits, when an episode ends — and the baseline it has
+to beat. Steps 3-5 are not started.
+
+Step 1's throughput number no longer reproduces on this machine. That is
+recorded below rather than quietly overwritten, because the cause is outside
+WSL and has not been established.
 
 ---
 
@@ -83,6 +88,32 @@ refused to certify the numbers.
 So walking is not ruled out by compute. It is ruled out for now by the
 no-overnight-runs rule, which makes it a three-session job rather than an
 impossible one.
+
+### The same benchmark now returns half that, and I cannot say why from in here
+
+Re-run on 2026-09-10 while building step 2, same code, same `walk` variant,
+same thread settings, machine otherwise idle and on mains power:
+
+| | 1-process env-steps/s | gate |
+|---|---|---|
+| step 1, certified | 6,666 | PASS |
+| re-run, 2026-09-10 | 3,069 | **FAIL** |
+
+`bench.py`'s own reference bracket calls this stable — it held to within 1%
+across the re-run, so it is not the drift the tool was built to catch. Load
+average was 0.1, nothing else was on the box, and the two Python processes
+present were idle system daemons. It reproduces across samples and across both
+`walk` and `groundcontact`, which differ from each other by only a few percent.
+
+Two things follow. The budget table above is optimistic by a factor of 2.2 in
+this state: 50M steps is 4.5 h, not 41 minutes, which turns the expected
+stand-and-recover run from one sitting into three chunked sessions. And the
+cause is the same class of question as the core-pinning one — it lives on the
+Windows side, where a guest cannot see power mode, charger wattage, thermal
+state, or a background scan. It is recorded as open rather than guessed at.
+
+**Nothing here is a reason to push the machine harder.** The thread budget
+stays at 8 of 14.
 
 ### Why the scaling is bad, and what I could not determine
 
@@ -225,36 +256,190 @@ until the body reaches the floor — and then sinks to −10.5 cm, which is find
 
 ---
 
+## Step 2 — the environment contract
+
+### The observation is 48-dim. Step 1 said 61, and 61 was wrong
+
+61 is everything the *simulator* knows about the robot. 48 is everything the
+*robot* knows about itself. The difference is thirteen numbers that are free in
+MuJoCo and do not exist on hardware:
+
+| dropped | dims | why the real duck cannot produce it |
+|---|---|---|
+| `imu_lin_vel` | 3 | a velocimeter. There is no state estimator on the robot, so base linear velocity is not measurable |
+| trunk position | 3 | world-frame xyz — same problem, and no external tracking rig in the loop |
+| `orientation` (full quat) | 4 | yaw is not observable from a gyro and an accelerometer. `sensors.xml` declares no magnetometer, so heading can only be integrated, and drifts |
+| `root_angmom` | 3 | subtree angular momentum: a MuJoCo computation over the body tree, not a sensor |
+
+A policy that reads those learns to depend on them and then has nothing to run
+on. Since the only claim this project can honestly make is about transfer, the
+observation is cut down to sensors the robot carries *before* any training
+happens. It costs nothing now and cannot be retrofitted later.
+
+What is left, and where each part comes from on hardware:
+
+| block | dims | source on the real robot |
+|---|---|---|
+| joint position | 14 | servo present-position |
+| joint velocity | 14 | servo present-velocity — real, and noisy. Included because the servos report it, not because it is clean |
+| previous action | 14 | the policy's own last output; it is in RAM |
+| gyro | 3 | IMU rate gyro |
+| projected gravity | 3 | world −Z in the trunk frame — the observable part of attitude, what an IMU with a complementary filter gives you |
+
+The gyro is read from the `angular-velocity` sensor rather than its twin
+`imu_ang_vel`. Both sit on the same site and read identically today, because
+MuJoCo applies a sensor's declared `noise` only when `mjENBL_SENSORNOISE` is
+set and it is not set here. But `angular-velocity` is the one upstream put
+`noise="0.005"` on. Step 4 flips the flag and gets the noise magnitude the
+robot's authors chose, instead of one invented to look reasonable.
+
+`test_env.py` rebuilds the observation from those five sources and asserts the
+environment's output matches bit-for-bit. That is the only way to prove nothing
+sim-only leaked in — and it checks separately that the excluded velocimeter is
+reading a live non-zero signal, so the exclusion is a real one rather than a
+channel that happens to be zero.
+
+### Actions, and a trap in the MJCF
+
+14 outputs in [−1, 1], applied as residuals around the STAND pose:
+
+```
+target = STAND_pose + 0.35 * action        then clipped to the joint limits
+```
+
+A saturated action moves a joint 0.35 rad, about 22% of the median joint range,
+in one 20 ms decision. That number is a hyperparameter, not a derived quantity;
+step 3 reports what happens at 0.2 and 0.5.
+
+The clip is not decoration. **`ctrlrange` on all 14 actuators is [−10, 10] rad,
+while the tightest joint limit — hip roll — is ±0.384 rad.** Handing a position
+actuator a 10 rad target raises nothing: it saturates against the joint stop and
+spends the entire force range holding there. Nothing in the model prevents this
+and nothing reports it.
+
+### Episodes and pushes
+
+250 steps at 50 Hz, five seconds, **fixed length with no early termination.**
+The usual locomotion setup ends the episode the moment the robot falls. That is
+right for walking and wrong here — recovery is half the task, and terminating
+on a fall makes falling unrecoverable by construction. It also keeps returns
+comparable: every episode is the same length, so a baseline that topples early
+gets a low return rather than a short episode that looks cheap.
+
+Three pushes per episode, drawn from the episode seed: magnitude uniform in
+0.15–0.45 m/s applied to the trunk's linear velocity, direction uniform in
+azimuth, timing uniform but held half a second clear of both ends. A push at
+t=0 is an initial condition rather than a disturbance, and one at the buzzer is
+never recovered from inside the episode.
+
+### Reward
+
+Six terms, all logged separately in `info` so step 3 can show which one is
+doing the work rather than reporting one scalar and calling it tuned.
+
+| term | weight | shape |
+|---|---|---|
+| upright | +1.0 | trunk z-axis vs world up, floored at 0 |
+| height | +1.0 | Gaussian on trunk height about 0.12 m, σ = 3 cm |
+| posture | −0.10 | mean squared joint deviation from STAND |
+| action rate | −0.05 | mean squared change in action |
+| joint velocity | −2e−4 | mean squared joint velocity |
+| effort | −0.02 | mean squared actuator force |
+
+A perfectly held stand scores 2.0 per step, so **500 is the episode ceiling.**
+
+### The baseline the policy has to beat
+
+The shipped PD controller commanded to hold STAND — which is what `zero_action`
+emits — over 20 seeds of the full task, pushes and initial-state noise included:
+
+| | value |
+|---|---|
+| return | **108.9 ± 2.8** of a 500 ceiling |
+| fraction of the episode on the floor | **54%** |
+| starts to tilt (upright cos < 0.9) | 0.64 s |
+| trunk reaches the floor | 2.54 s |
+
+Those last two reconcile step 1's drop test with this one: 0.79 s was the
+toppling threshold, 2.54 s is ground contact. Same event, measured at two
+points on the way down.
+
+### The vector env
+
+`vec_env.py` forks N workers over pipes, one env each, capped at the 8-of-14
+budget. Env *i* is seeded `seed + i`, and a test asserts that **N workers
+reproduce N sequential envs bit-for-bit** — so a run is reproducible at any
+worker count, and a result cannot quietly depend on how it was parallelised.
+
+Measured single-process, the environment wrapper — observation assembly,
+reward, push scheduling — costs **0%** over a bare `mj_step` loop: 2,771
+against 2,776 env-steps/s. The physics dominates completely, which is the
+expected answer for a 16-body model and worth having as a number rather than an
+assumption.
+
+### What the tests catch that would otherwise be silent
+
+The last check runs the observation builder on `walk_backlash`, the held-out
+model, and compares the correct strided index against the obvious shortcut:
+
+| | result |
+|---|---|
+| `qpos[7:21]` on `walk_backlash` | wrong on **13 of 14** joints, by up to **0.938 rad** |
+| actuator names and order | identical to `groundcontact` — a policy transfers with no remapping |
+
+Reading a mixture of joint angles and backlash deflections produces entirely
+plausible numbers and no error. That is exactly the failure that would make a
+sim-to-sim transfer result meaningless while looking fine.
+
+---
+
 ## Scope, now that the gate has been measured
 
-- **In:** stand and recover from pushes, on `groundcontact`, ~50M env steps,
-  about 41 minutes of training.
+- **In:** stand and recover from pushes, on `groundcontact`, ~50M env steps.
+  41 minutes at step 1's measured rate, 4.5 h at the rate the box currently
+  returns — so budget it as three chunked sessions until that is resolved.
 - **In:** domain randomisation over the four measured actuator classes,
   evaluated on `walk_backlash` as held-out physics.
-- **Deferred, not blocked:** a walking gait. 400M steps is 5.5 h, which is three
-  chunked sessions. Revisit if steps 2-4 land early.
+- **Deferred, not blocked:** a walking gait. 400M steps was 5.5 h at step 1's
+  rate and is 36 h at the current one, which moves it from three sessions to
+  out of reach. It depends entirely on the throughput question above.
 - **Out:** anything requiring mjlab, MuJoCo Warp, or a GPU.
 
 ## Steps
 
 1. **Feasibility gate — done.** Asset fetch, model inspection, CPU throughput,
    drop tests. This README.
-2. Environment contract: 61-dim observation, 14-dim action, 50 Hz, hand-written
-   multiprocess vector env, tests.
+2. **Environment contract — done.** 48-dim observation, 14-dim action, 50 Hz,
+   fixed-length episodes with seeded pushes, hand-written multiprocess vector
+   env, 20 contract tests.
 3. PPO against a PD hold-pose baseline, reusing the implementation from
    [ppo-from-scratch](https://github.com/AungKaung1928/ppo-from-scratch).
    Metric: recovery rate under randomised pushes, n=100, seeds reported.
 4. Domain randomisation, evaluated on `walk_backlash`. Report the gap.
 5. ONNX export, single-thread latency, verified against PyTorch two ways.
 
-## What step 1 does not prove
+## What steps 1 and 2 do not prove
 
 - Nothing here trains anything. Throughput is measured with random actions
   around STAND. A real PPO loop adds policy forward passes, advantage
-  computation and optimiser steps on top, so 20,184 env-steps/s is an upper
+  computation and optimiser steps on top, so the measured rate is an upper
   bound on the rollout half only, not on training.
+- **The throughput figure is unsettled.** Step 1 certified 20,184 env-steps/s
+  across 8 processes; the single-process re-run returns 46% of what it did
+  then. Every wall-clock estimate in this README should be read as a range
+  until that is closed out.
 - The 0.79 s fall time is one deterministic rollout from one keyframe. It is a
-  baseline to beat, not a distribution.
+  baseline to beat, not a distribution. The 108.9 ± 2.8 return is the
+  distributional version of it, over 20 seeds, and that is the number step 3
+  should be compared against.
+- The reward weights are chosen, not tuned. Nothing has optimised against them
+  yet, so they are a starting point and the first thing to suspect if step 3
+  learns something strange.
+- The environment is not validated by a policy learning in it. Twenty contract
+  tests say it does what it claims; they cannot say the task is learnable. That
+  is what step 3 is for.
+- No observation noise, no domain randomisation, no actuator variation. The
+  environment runs one nominal physics model. Step 4 adds the spread.
 - Every rate here was measured with a background interactive process consuming
   about 9% of one core. That is a systematic offset present in all rows
   equally, so the comparisons hold, but the absolute numbers are a few percent
@@ -273,7 +458,7 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
 ./fetch_assets.sh        # pinned upstream commit, ~24 MB, gitignored
-./verify.sh              # tiers 1-3 are cheap; tier 4 loads the box
+./verify.sh              # tiers 1-4 are cheap; tier 5 loads the box
 ```
 
 The benchmark is the only part that needs the machine to itself:
