@@ -129,13 +129,25 @@ check("reward equals the sum of its logged terms, every step",
       f"{len(info['terms'])} terms, worst residual {worst:.1e}: {', '.join(sorted(info['terms']))}")
 
 print("\n--- determinism and seeding ---")
-a_obs, a_rew = rollout(env.MicroduckEnv(seed=11), 200, ACTIONS)
+# All three reset. An earlier version rolled the first one out straight from
+# the constructor and then discarded the result -- 200 steps of a push-free
+# episode, compared against nothing. step() now refuses that, and the check
+# below is the one it was presumably meant to be.
+e = env.MicroduckEnv(seed=11); e.reset(seed=11)
+a_obs, a_rew = rollout(e, 200, ACTIONS)
 e = env.MicroduckEnv(seed=11); e.reset(seed=11)
 b_obs, b_rew = rollout(e, 200, ACTIONS)
 e = env.MicroduckEnv(seed=11); e.reset(seed=11)
 c_obs, c_rew = rollout(e, 200, ACTIONS)
-check("same seed replays bit-for-bit",
-      np.array_equal(b_obs, c_obs) and np.array_equal(b_rew, c_rew))
+check("same seed replays bit-for-bit, three independent constructions",
+      np.array_equal(a_obs, b_obs) and np.array_equal(b_obs, c_obs)
+      and np.array_equal(a_rew, b_rew) and np.array_equal(b_rew, c_rew))
+try:
+    env.MicroduckEnv(seed=11).step(ACTIONS[0])
+    check("step() before reset() is refused", False, "it was allowed")
+except RuntimeError as exc:
+    check("step() before reset() is refused, not silently run push-free",
+          "reset()" in str(exc))
 e1, e2 = env.MicroduckEnv(seed=1), env.MicroduckEnv(seed=2)
 e1.reset(seed=1); e2.reset(seed=2)
 check("different seeds draw different push schedules",
@@ -155,6 +167,44 @@ check("trajectory is identical before the push and diverges on the push step",
       first == at, f"scheduled step {at}, first divergence {first}, "
                    f"|dv| {np.linalg.norm(ea._push_vel[0]):.3f} m/s")
 
+print("\n--- the observation is one instant, not two ---")
+# mj_step leaves sensordata and xpos a physics substep behind qpos/qvel, so
+# without a forward pass the gyro in the observation is 2 ms older than the
+# joint angles beside it. Nothing raises; the policy just learns on an IMU
+# reading no real IMU would produce.
+e = env.MicroduckEnv(seed=3); e.reset(seed=3)
+worst_g = worst_h = 0.0
+for a in ACTIONS[:120]:
+    o, _, _, info = e.step(a)
+    stale_g, stale_h = o[42:45].copy(), info["trunk_height"]
+    mujoco.mj_forward(e.model, e.data)
+    worst_g = max(worst_g, float(np.abs(e.observe()[42:45] - stale_g).max()))
+    worst_h = max(worst_h, abs(common.trunk_height(e.model, e.data) - stale_h))
+check("gyro and trunk height are already current when step() returns",
+      worst_g < 1e-9 and worst_h < 1e-9,
+      f"gyro drift {worst_g:.2e}, height drift {worst_h:.2e} m")
+
+print("\n--- reset clamps the initial state to the joint limits ---")
+# The clamp used np.clip(..., out=qpos[idx]) with an integer index array, so it
+# wrote into a temporary copy and did nothing. Invisible at init_noise=0.02.
+e = env.MicroduckEnv(seed=5, init_noise=0.6)
+worst = 0.0
+for k in range(30):
+    e.reset()
+    q = e.data.qpos[e._qpos_i]
+    worst = max(worst, float(np.maximum(e._lo - q, q - e._hi).max()))
+check("no joint starts outside its range, even at init_noise=0.6",
+      worst <= 1e-12, f"worst excursion {worst:+.2e} rad over 30 resets")
+
+print("\n--- truncation is distinguishable from termination ---")
+e = env.MicroduckEnv(seed=9); e.reset(seed=9)
+flags = [e.step(ACTIONS[k % 300])[3] for k in range(env.MicroduckEnv(seed=0).episode_steps)]
+ends = [(i, f) for i, f in enumerate(flags) if f["truncated"]]
+check("every episode end is flagged truncated and never terminated",
+      len(ends) == 1 and ends[0][0] == 249
+      and not any(f["terminated"] for f in flags),
+      "so a PPO loop must bootstrap V(terminal_obs) rather than zero it")
+
 print("\n--- vector env ---")
 n = 3
 with vec_env.VecEnv(n=n, seed=100) as v:
@@ -173,6 +223,21 @@ check(f"{n} workers reproduce {n} sequential envs bit-for-bit",
       np.array_equal(v_obs, s_obs) and np.allclose(v_rew, s_rew, atol=0),
       "env i is seeded seed+i, so a run is reproducible at any worker count")
 check("worker count is capped at the machine's 8-of-14 budget", vec_env.MAX_WORKERS == 8)
+try:
+    vec_env.VecEnv(n=99)
+    check("over-budget VecEnv is refused", False, "it was allowed")
+except ValueError:
+    # The point is that nothing follows this: __del__ runs close(), and before
+    # self.closed was set first it raised AttributeError from inside __del__
+    # and buried the ValueError under "Exception ignored in __del__".
+    check("over-budget VecEnv raises ValueError and nothing else", True)
+try:
+    vec_env.VecEnv(n=2, variant="no_such_variant")
+    check("a worker that fails to construct is reported by index", False,
+          "it was allowed")
+except RuntimeError as exc:
+    check("a worker that fails to construct is reported by index, not as EOFError",
+          "worker 0" in str(exc) and "no_such_variant" in str(exc))
 
 print("\n--- the held-out physics model, which is the point of all of this ---")
 eb = env.MicroduckEnv(variant="walk_backlash", seed=0, init_noise=0.0)

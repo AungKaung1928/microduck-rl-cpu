@@ -25,6 +25,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import multiprocessing as mp   # noqa: E402
+import traceback              # noqa: E402
 
 import numpy as np             # noqa: E402
 
@@ -34,9 +35,26 @@ MAX_WORKERS = 8   # the thread budget on this machine. bench.py enforces the sam
 
 
 def _worker(conn, seed, kwargs, with_terms):
-    e = _env.MicroduckEnv(seed=seed, **kwargs)
-    obs = e.reset(seed=seed)
-    conn.send(obs)
+    """One env in one process.
+
+    Every message to the parent is tagged ("ok", payload) or ("error", text).
+    Without the tag a worker that dies leaves the parent blocked in recv(),
+    which then raises a bare EOFError naming neither the worker nor the cause;
+    the child's traceback does reach stderr, but in a redirected training log
+    it lands nowhere near the failure. Construction is inside the guard too,
+    because a bad env_kwargs fails there and produced the same bare EOFError
+    out of VecEnv.__init__.
+    """
+    try:
+        e = _env.MicroduckEnv(seed=seed, **kwargs)
+        conn.send(("ok", e.reset(seed=seed)))
+    except BaseException:
+        try:
+            conn.send(("error", traceback.format_exc()))
+        except (BrokenPipeError, OSError):
+            pass
+        conn.close()
+        return
     try:
         while True:
             cmd, payload = conn.recv()
@@ -45,7 +63,13 @@ def _worker(conn, seed, kwargs, with_terms):
                 small = {"fallen": info["fallen"],
                          "upright_cos": info["upright_cos"],
                          "trunk_height": info["trunk_height"],
-                         "pushed": info["pushed"]}
+                         "pushed": info["pushed"],
+                         "t": info["t"],
+                         # Carried across because a truncation is not a
+                         # terminal state and the consumer cannot tell from
+                         # `done` alone. See MicroduckEnv.step.
+                         "truncated": info["truncated"],
+                         "terminated": info["terminated"]}
                 if with_terms:
                     small["terms"] = info["terms"]
                 if done:
@@ -54,11 +78,16 @@ def _worker(conn, seed, kwargs, with_terms):
                     # needs the one it just ended on, so both go across.
                     small["terminal_obs"] = obs
                     obs = e.reset()
-                conn.send((obs, rew, done, small))
+                conn.send(("ok", (obs, rew, done, small)))
             elif cmd == "reset":
-                conn.send(e.reset(seed=payload))
+                conn.send(("ok", e.reset(seed=payload)))
             elif cmd == "close":
                 break
+    except BaseException:
+        try:
+            conn.send(("error", traceback.format_exc()))
+        except (BrokenPipeError, OSError):
+            pass
     finally:
         conn.close()
 
@@ -72,6 +101,12 @@ class VecEnv:
     """
 
     def __init__(self, n=4, seed=0, with_terms=False, **env_kwargs):
+        # Before anything that can raise. __del__ calls close(), so a
+        # constructor that fails validation would otherwise raise
+        # AttributeError from inside __del__ and bury the real ValueError
+        # under "Exception ignored in __del__".
+        self.closed = False
+        self._conns, self._procs = [], []
         if n > MAX_WORKERS:
             raise ValueError(
                 f"{n} workers requested; the budget on this machine is {MAX_WORKERS} "
@@ -79,8 +114,6 @@ class VecEnv:
             )
         ctx = mp.get_context("fork")
         self.n = n
-        self.closed = False
-        self._conns, self._procs = [], []
         for i in range(n):
             parent, child = ctx.Pipe()
             p = ctx.Process(target=_worker, daemon=True,
@@ -89,21 +122,41 @@ class VecEnv:
             child.close()
             self._conns.append(parent)
             self._procs.append(p)
-        self._last_obs = np.stack([c.recv() for c in self._conns])
+        self._last_obs = np.stack([self._recv(i) for i in range(n)])
+
+    def _recv(self, i):
+        """Receive one tagged message, and name the worker when it goes wrong."""
+        try:
+            tag, payload = self._conns[i].recv()
+        except EOFError:
+            raise RuntimeError(
+                f"worker {i} exited without replying. Its traceback went to "
+                f"stderr -- in a redirected log, look above this line."
+            ) from None
+        if tag == "error":
+            raise RuntimeError(f"worker {i} raised:\n{payload}")
+        return payload
 
     def reset(self, seed=None):
+        """Bare reset() returns the current observation; it does not restart.
+
+        Passing `seed` restarts every worker on `seed + i` and REPLACES its
+        RNG, so calling `reset(seed=cfg.seed)` once per training iteration
+        replays one identical episode forever. Autoreset inside step() is the
+        path a training loop should use.
+        """
         if seed is None:
             return self._last_obs.copy()
         for i, c in enumerate(self._conns):
             c.send(("reset", seed + i))
-        self._last_obs = np.stack([c.recv() for c in self._conns])
+        self._last_obs = np.stack([self._recv(i) for i in range(self.n)])
         return self._last_obs.copy()
 
     def step(self, actions):
         actions = np.asarray(actions).reshape(self.n, _env.ACT_DIM)
         for c, a in zip(self._conns, actions):
             c.send(("step", a))
-        out = [c.recv() for c in self._conns]
+        out = [self._recv(i) for i in range(self.n)]
         obs = np.stack([o[0] for o in out])
         rew = np.array([o[1] for o in out], dtype=np.float64)
         done = np.array([o[2] for o in out], dtype=bool)

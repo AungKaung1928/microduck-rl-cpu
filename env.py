@@ -157,6 +157,7 @@ class MicroduckEnv:
         self._push_at = np.zeros(0, dtype=int)
         self._push_vel = np.zeros((0, 2))
         self._pushes_done = 0
+        self._episode_started = False
 
         common.reset_to(self.model, self.data, "STAND")
         h = common.trunk_height(self.model, self.data)
@@ -210,6 +211,13 @@ class MicroduckEnv:
                                    speed * np.sin(theta)], axis=1)
 
     def reset(self, seed=None):
+        """Start a new episode. `seed` REPLACES the RNG, it does not advance it.
+
+        So `reset(seed=S)` inside a training loop gives the same push schedule
+        and the same initial noise every single episode, forever. Seed once at
+        construction, or on a deliberate replay, and call `reset()` bare after
+        that. `VecEnv` autoreset does the right thing already.
+        """
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         common.reset_to(self.model, self.data, "STAND")
@@ -217,16 +225,31 @@ class MicroduckEnv:
             n = self.init_noise
             self.data.qpos[self._qpos_i] += self.rng.uniform(-n, n, ACT_DIM)
             self.data.qvel[self._qvel_i] += self.rng.uniform(-5 * n, 5 * n, ACT_DIM)
-            np.clip(self.data.qpos[self._qpos_i], self._lo, self._hi,
-                    out=self.data.qpos[self._qpos_i])
+            # Assignment, not `out=`. `self._qpos_i` is an integer array, so
+            # `qpos[idx]` is a copy and `np.clip(..., out=qpos[idx])` writes
+            # into a temporary that is then discarded -- the clamp silently did
+            # nothing. Harmless at the default init_noise of 0.02, because the
+            # tightest joint sits 0.297 rad clear of its limit at STAND, and
+            # live the moment step 4 randomises the initial state wider than
+            # that. Measured at init_noise=0.6: 2 of 14 joints started 0.086 rad
+            # outside their range, MuJoCo applied a limit impulse at t=0, and
+            # nothing reported it.
+            self.data.qpos[self._qpos_i] = np.clip(
+                self.data.qpos[self._qpos_i], self._lo, self._hi)
             mujoco.mj_forward(self.model, self.data)
         self._prev_action = np.zeros(ACT_DIM)
         self._t = 0
         self._pushes_done = 0
+        self._episode_started = True
         self._schedule_pushes()
         return self.observe()
 
     def step(self, action):
+        if not self._episode_started:
+            raise RuntimeError(
+                "call reset() before step(). A freshly constructed env has an "
+                "empty push schedule, so stepping it produces a push-free "
+                "episode and raises nothing.")
         action = np.clip(np.asarray(action, dtype=float).reshape(ACT_DIM), -1.0, 1.0)
         target = np.clip(self._default + self.action_scale * action, self._lo, self._hi)
         self.data.ctrl[:] = target
@@ -240,6 +263,21 @@ class MicroduckEnv:
         for _ in range(common.SUBSTEPS):
             mujoco.mj_step(self.model, self.data)
 
+        # mj_step integrates qpos and qvel to t+1 and leaves everything derived
+        # from them -- sensordata, xpos, actuator_force, contacts -- at t. Read
+        # straight after the loop, the observation pairs joint angles from t+1
+        # with a gyro reading from 2 ms earlier, and the reward scores a pose
+        # the robot has already left. Measured over a 250-step episode: up to
+        # 0.054 rad/s on the gyro, 0.011 on upright cosine, 1.4 mm on trunk
+        # height against the height term's 30 mm sigma.
+        #
+        # It matters here more than it would elsewhere. The whole claim behind
+        # the 48-dim observation is that every channel is one a real robot
+        # could produce, and no real IMU reports an angular rate that disagrees
+        # with its own encoders by a timestep. One forward pass, no integration,
+        # costs about 8% of the control step and buys a consistent snapshot.
+        mujoco.mj_forward(self.model, self.data)
+
         terms = self._reward_terms(action)
         reward = float(sum(terms.values()))
         self._prev_action = action
@@ -249,7 +287,15 @@ class MicroduckEnv:
         h = common.trunk_height(self.model, self.data)
         info = {"terms": terms, "trunk_height": h,
                 "upright_cos": common.upright_cos(self.model, self.data),
-                "fallen": h < FALL_HEIGHT, "pushed": pushed, "t": self._t}
+                "fallen": h < FALL_HEIGHT, "pushed": pushed, "t": self._t,
+                # This task has no early termination by design, so `done` is
+                # ALWAYS the step limit and never a terminal state. Both flags
+                # are carried explicitly because the distinction is invisible
+                # otherwise and a stock GAE loop gets it wrong by default:
+                # zeroing the bootstrap at a truncation corrupts the value
+                # target back about 100 steps at gamma=0.99, which is 40% of a
+                # 250-step episode. Bootstrap V(terminal_obs) on every done.
+                "truncated": bool(done), "terminated": False}
         return self.observe(), reward, done, info
 
     def _reward_terms(self, action):
