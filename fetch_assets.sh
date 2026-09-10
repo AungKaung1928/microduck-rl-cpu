@@ -35,8 +35,16 @@ echo "assets/: $N_XML xml, $N_MESH stl, $(du -sh assets | cut -f1)"
 
 # Load-test the three scenes this project actually uses. A copied tree that
 # does not compile is worse than no tree, and it fails silently until training.
-source ~/personal/ml/env.sh
-python - <<'PY'
+# Python comes from whatever environment is active. A venv is expected but not
+# required; the only hard dependencies are mujoco and numpy.
+PY="${PYTHON:-python3}"
+if ! "$PY" -c 'import mujoco, numpy' 2>/dev/null; then
+  echo "mujoco/numpy are not importable with '$PY'. From the repo root:" >&2
+  echo "    python3 -m venv .venv && . .venv/bin/activate" >&2
+  echo "    pip install -r requirements.txt" >&2
+  exit 1
+fi
+"$PY" - <<'PY'
 import mujoco, sys
 for s in ("scene_walk.xml", "scene_walk_backlash.xml", "scene_rollers.xml"):
     m = mujoco.MjModel.from_xml_path(f"assets/{s}")

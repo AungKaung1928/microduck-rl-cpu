@@ -8,7 +8,8 @@ evaluated on physics it never trained on, and exported to ONNX.
 The reason this project exists in this form: upstream trains the duck with
 mjlab on MuJoCo Warp, which requires CUDA. There is no GPU on this machine and
 no hardware to buy. So the whole thing runs the same MJCF in plain CPU MuJoCo,
-parallel across processes, inside an 8-of-14-thread budget on a company laptop.
+parallel across processes, inside an 8-of-14-thread budget on a laptop that
+has other work to do.
 
 **Step 1 is done: the feasibility gate.** It answers one question — is this
 machine fast enough to train a policy at all — and it turned up three things
@@ -254,16 +255,23 @@ until the body reaches the floor — and then sinks to −10.5 cm, which is find
   bound on the rollout half only, not on training.
 - The 0.79 s fall time is one deterministic rollout from one keyframe. It is a
   baseline to beat, not a distribution.
-- Every rate here was measured with the Claude Code process consuming about 9%
-  of one core. That is a systematic offset present in all rows equally, so the
-  comparisons hold, but the absolute numbers are a few percent pessimistic.
+- Every rate here was measured with a background interactive process consuming
+  about 9% of one core. That is a systematic offset present in all rows
+  equally, so the comparisons hold, but the absolute numbers are a few percent
+  pessimistic.
 - Run-to-run spread on the sweep is roughly ±10%. Two significant figures is all
   these numbers support.
 
 ## Reproducing
 
+From a fresh clone. The only hard dependencies are `mujoco` and `numpy`.
+
 ```bash
-cd ~/personal/ml/microduck-rl-cpu
+git clone https://github.com/AungKaung1928/microduck-rl-cpu.git
+cd microduck-rl-cpu
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+
 ./fetch_assets.sh        # pinned upstream commit, ~24 MB, gitignored
 ./verify.sh              # tiers 1-3 are cheap; tier 4 loads the box
 ```
@@ -271,16 +279,19 @@ cd ~/personal/ml/microduck-rl-cpu
 The benchmark is the only part that needs the machine to itself:
 
 ```bash
-cd ~/personal/ml/microduck-rl-cpu
-source ~/personal/ml/env.sh
 nice -n 10 python bench.py --seconds 20 --ref-seconds 10 --tag main
 nice -n 10 python bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
 ```
 
 `bench.py` brackets every configuration with a single-process reference window
 and refuses to certify the table if that reference drifts more than 10%. It also
-refuses to run more than 8 processes without an explicit flag, because this is a
-company laptop and the budget is 8 of 14 cores.
+refuses to run more than 8 processes without an explicit flag: the thread budget
+on this machine is 8 of 14 cores, and every number in this README was measured
+inside it.
+
+Rendering — only the drop-test filmstrips need it — goes through whatever
+`MUJOCO_GL` names. If it fails, set it to `glfw`, `egl` or `osmesa`, whichever
+your machine actually has.
 
 ### Measured environment
 

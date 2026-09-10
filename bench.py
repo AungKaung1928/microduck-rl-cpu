@@ -1,8 +1,8 @@
 """How fast can this laptop actually simulate the Microduck?
 
 This is the feasibility gate for the whole project. Upstream trains on GPU with
-4096 parallel environments; this box has no GPU and an 8-thread budget on a
-company laptop. If the answer here is too slow, the project scope shrinks from
+4096 parallel environments; this box has no GPU and an 8-of-14-thread budget.
+If the answer here is too slow, the project scope shrinks from
 walking to standing, and that decision gets made on a measured number rather
 than on a feeling.
 
@@ -177,7 +177,7 @@ def main():
     ap.add_argument("--gate", type=float, default=5000.0,
                     help="env-steps/s below which walking leaves the scope")
     ap.add_argument("--allow-overcommit", action="store_true",
-                    help="permit more than 8 processes (company-laptop cap)")
+                    help="permit more than 8 processes (past the thread budget)")
     ap.add_argument("--sustained", type=int, default=0, metavar="N",
                     help="instead of the sweep, hold N processes flat out and "
                          "report the rate per window (what a training run does)")
@@ -189,9 +189,10 @@ def main():
     out = a.out or f"runs/bench{('_' + a.tag) if a.tag else ''}.json"
 
     if max(a.procs) > 8 and not a.allow_overcommit:
-        raise SystemExit("refusing >8 processes: this is a company laptop and "
-                         "env.sh caps the budget at 8 of 14 cores. "
-                         "Pass --allow-overcommit if that is really intended.")
+        raise SystemExit("refusing >8 processes: the thread budget on this "
+                         "machine is 8 of 14 cores, and every number in the "
+                         "README was measured inside it. Pass "
+                         "--allow-overcommit if that is really intended.")
     if a.pin and len(a.pin) < max(a.procs):
         raise SystemExit(f"--pin needs at least {max(a.procs)} cores")
 

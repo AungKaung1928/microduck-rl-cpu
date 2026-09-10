@@ -1,0 +1,9 @@
+# Pinned to what the README's numbers were measured on.
+mujoco==3.12.0
+numpy==2.2.6
+
+# Optional. Only drop_test.py's filmstrip needs an image writer, and it tries
+# cv2 first, then matplotlib, then skips rendering. Everything else -- the
+# tests, the model inspection, the benchmark -- runs on the two above.
+#   opencv-python-headless
+#   matplotlib
