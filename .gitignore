@@ -1,0 +1,13 @@
+# Upstream MJCF and meshes. Not committed: the 3D model files are CC BY-SA-NC
+# and this is a public repo. ./fetch_assets.sh reproduces the tree from a
+# pinned commit.
+assets/
+
+__pycache__/
+out/*
+!out/*.png
+runs/*
+!runs/*.json
+
+# scratch probe from an earlier, buggy version of bench.py
+runs/bench.json

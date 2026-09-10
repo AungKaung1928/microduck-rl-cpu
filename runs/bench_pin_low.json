@@ -1,0 +1,30 @@
+{
+  "variant": "walk",
+  "seconds": 20.0,
+  "ref_seconds": 10.0,
+  "cores": 14,
+  "pin": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "ref_before": 6129.114195224702,
+  "rows": [
+    {
+      "procs": 4,
+      "env_steps_per_s": 15530.383442752505,
+      "per_proc": 3882.5958606881263,
+      "per_proc_spread": 76.28264045551214,
+      "resets": 6632,
+      "speedup": 2.533870792430739,
+      "efficiency": 0.6334676981076848,
+      "ref_after": 6242.75655559829,
+      "ref_drift": 0.018541400397161567
+    }
+  ],
+  "worst_ref_drift": 0.018541400397161567,
+  "stable": true,
+  "gate": 5000.0,
+  "pass": true
+}
