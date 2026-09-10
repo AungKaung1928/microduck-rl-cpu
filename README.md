@@ -129,39 +129,45 @@ still there is open.
 is a bare `mj_step` loop on `walk`. The task runs the Python environment
 wrapper on `groundcontact`, and both of those cost:
 
-| single process, 12 s windows | bare `mj_step` | through `MicroduckEnv` | wrapper cost |
+| single process, 10 s windows | bare `mj_step` | through `MicroduckEnv` | wrapper cost |
 |---|---|---|---|
-| `walk` | 7,414 | 6,028 | 23% |
-| `groundcontact` | 5,091 | 4,505 | **13%** |
+| `walk` | 7,505 | 5,692 | 32% |
+| `groundcontact` | 5,223 | 4,175 | **25%** |
 
 `runs/bench_wrapper.json`, reproduced by `bench_wrapper.py`. `groundcontact`
-enables ten ground-collidable geoms against `walk`'s two, so it is 31% slower
+enables ten ground-collidable geoms against `walk`'s two, so it is 30% slower
 before any Python runs.
 
-This corrects an earlier claim in this README that the wrapper cost **0%**,
-measured at 2,771 against 2,776 env-steps/s. That measurement was taken during
-the reduced-power window, where the physics was slow enough to hide a fixed
-Python cost underneath it. On a healthy box the wrapper is visible. 13% is
-still not where optimisation effort should go — the physics is 87% of the step
-— but 0% was wrong, and it was wrong in the flattering direction.
+About half of that 25% is a correctness fix rather than wrapper overhead.
+`mj_step` integrates `qpos` and `qvel` but leaves `sensordata` and `xpos` a
+substep behind, so `step()` now calls `mj_forward` before reading them; that
+alone costs 7% of throughput and is the reason the figure moved from 13% to
+25% during step 2. It is not an optimisation target — see *Known risks going
+into step 3*.
+
+This also corrects an earlier claim in this README that the wrapper cost
+**0%**, measured at 2,771 against 2,776 env-steps/s. That measurement was taken
+during the reduced-power window, where the physics was slow enough to hide a
+fixed Python cost underneath it. On a healthy box the wrapper is visible. 0%
+was wrong, and it was wrong in the flattering direction.
 
 So the rate a training budget should use is the measured single-process wrapped
 rate on `groundcontact` times the measured 8-process speedup:
-**4,505 × 4.41 = ~19,900 env-steps/s.** The assumption inside that product is
+**4,175 × 4.41 = ~18,400 env-steps/s.** The assumption inside that product is
 that a scaling factor measured on bare `walk` physics carries to wrapped
 `groundcontact`; it is a projection, not a measurement, and it is flagged as
 one every time it is used below.
 
-| budget | at ~19,900 (projected) | if the −28% decay also returns (~14,300) |
+| budget | at ~18,400 (projected) | if the −28% decay also returns (~13,250) |
 |---|---|---|
-| 10M (hyperparameter probe) | 8 min | 12 min |
-| 50M (stand + push recovery, expected) | 42 min | 58 min |
-| 100M (stand, generous) | 1.4 h | 1.9 h |
-| 400M (walking gait, upstream-scale) | 5.6 h → 3 chunks | 7.8 h → 4 chunks |
+| 10M (hyperparameter probe) | 9 min | 13 min |
+| 50M (stand + push recovery, expected) | 45 min | 1.0 h |
+| 100M (stand, generous) | 1.5 h | 2.1 h |
+| 400M (walking gait, upstream-scale) | 6.0 h → 4 chunks | 8.4 h → 5 chunks |
 
 **The scope conclusion is the same at either end of that range**, which is what
 makes the range tolerable: the expected stand-and-recover run is a single
-sitting, and walking is three or four chunked sessions rather than out of
+sitting, and walking is four or five chunked sessions rather than out of
 reach. Two commands close the range, and neither has been run since the
 recovery:
 
@@ -417,14 +423,23 @@ emits — over 20 seeds of the full task, pushes and initial-state noise include
 
 | | value |
 |---|---|
-| return | **108.9 ± 2.8** of a 500 ceiling |
+| return | **108.7 ± 2.9** of a 500 ceiling |
 | fraction of the episode on the floor | **54%** |
-| starts to tilt (upright cos < 0.9) | 0.64 s |
-| trunk reaches the floor | 2.54 s |
+| starts to tilt (upright cos < 0.9) | 0.65 s |
+| trunk reaches the floor (height < 4 cm) | 2.28 s |
 
 Those last two reconcile step 1's drop test with this one: 0.79 s was the
-toppling threshold, 2.54 s is ground contact. Same event, measured at two
+toppling threshold, 2.28 s is ground contact. Same event, measured at two
 points on the way down.
+
+`baseline.py` produces this table and writes `runs/baseline.json`. It exists
+because the first version of these numbers — 108.9 ± 2.8, and a ground-contact
+time of 2.54 s against a threshold that was never written down — came from an
+ad-hoc script that was not kept, exactly like the 0% wrapper figure that turned
+out to be 25%. The return survived the re-measurement to within the noise it
+already reported. The contact time did not, and there is no way to tell now
+whether that is the `mj_forward` fix or a different threshold, which is the
+argument for the file existing.
 
 ### The vector env
 
@@ -434,10 +449,10 @@ reproduce N sequential envs bit-for-bit** — so a run is reproducible at any
 worker count, and a result cannot quietly depend on how it was parallelised.
 
 Measured single-process on `groundcontact`, the environment wrapper —
-observation assembly, reward, push scheduling, episode bookkeeping — costs
-**13%** over a bare `mj_step` loop doing the same substeps: 4,505 against
-5,091 env-steps/s. The physics is the other 87%, which is the expected answer
-for a 16-body model and worth having as a number rather than an assumption.
+observation assembly, reward, push scheduling, episode bookkeeping, and the
+`mj_forward` that keeps the observation on one timestamp — costs **25%** over
+a bare `mj_step` loop doing the same substeps: 4,175 against 5,223 env-steps/s.
+Roughly 7 points of that is the `mj_forward`; the physics is the rest.
 `bench_wrapper.py` measures both halves back to back in one process.
 
 An earlier version of this README reported that cost as 0%, from 2,771 against
@@ -463,6 +478,68 @@ sim-to-sim transfer result meaningless while looking fine.
 
 ---
 
+## Known risks going into step 3
+
+Step 2 closed with the environment reviewed against the thing that is about to
+consume it, rather than against its own tests. Five defects came out of that,
+all of them silent, and three measured properties that are not defects but
+decide whether step 3 learns anything.
+
+### The five, all fixed, all with a test that fails without the fix
+
+| defect | why nothing raised |
+|---|---|
+| `step()` returned an observation from two different instants: `mj_step` integrates `qpos`/`qvel` to t+1 and leaves `sensordata` and `xpos` at t, so the gyro was 2 ms older than the joint angles beside it | Every number was plausible. Measured, it was 0.054 rad/s on the gyro and 1.4 mm on trunk height against a 30 mm reward sigma. It attacks the one claim this project makes — that every observation channel is one real hardware could produce — and no IMU disagrees with its own encoders by a timestep |
+| the reset clamp on the initial joint state never executed: `np.clip(qpos[idx], lo, hi, out=qpos[idx])` with an integer index array writes into a temporary copy | Latent at the default `init_noise=0.02`, because the tightest joint sits 0.297 rad clear of its limit. At 0.6, two joints of fourteen start 0.086 rad outside their range and MuJoCo applies a limit impulse at t=0. Step 4 is what raises `init_noise` |
+| `done` carried no truncation flag, while every episode ends on the step limit and none on a terminal state | A stock GAE loop zeroes the bootstrap at `done`. At γ=0.99 that corrupts the value target about 100 steps back into a 250-step episode. The training curve still goes up |
+| a worker that died gave the parent a bare `EOFError` naming neither the worker nor the cause, and a bad `env_kwargs` failed the same way out of the constructor | The child's traceback does reach stderr, but in a redirected training log it is nowhere near the failure |
+| `step()` before `reset()` ran an episode with no pushes at all, and `VecEnv.__init__` raising validation errors emitted `AttributeError` from `__del__` on top of them | The push-free rollout is a valid-looking episode. One test in this repo was doing exactly that and discarding the result |
+
+`step()` now calls `mj_forward` before reading anything, which costs 7% of
+throughput and is already in the budget above. It is a correctness cost, not
+overhead: do not optimise it away.
+
+### The three that are decisions, not bugs
+
+`baseline.py` measures all three and writes `runs/baseline.json`.
+
+**Three of the four reward penalties are numerically dead.** Per-episode
+contribution, 20 seeds, against the PD baseline and against random actions:
+
+| term | weight | PD | random |
+|---|---|---|---|
+| upright | +1.0 | 70.0 | 67.9 |
+| height | +1.0 | 38.8 | 40.8 |
+| action_rate | −0.05 | 0.00 | −8.33 |
+| posture | −0.10 | −0.15 | −0.22 |
+| effort | −0.02 | −0.01 | −0.07 |
+| joint_vel | −2e−4 | −0.00 | −0.04 |
+
+`action_rate` is zero for the PD baseline only because a constant action has no
+rate; it is live. The other three are under 0.25% of the return under both
+policies. `joint_vel`'s −2e−4 was chosen for the ~20 rad/s of a fall, and
+measured joint speed is under 1 rad/s — 400x smaller once squared. So this
+README's claim that step 3 can report which penalty is doing the work would
+report three zeros, and effort and velocity regularisation, which is what
+usually governs whether a policy transfers, is absent in practice. **Reweighting
+changes the baseline and is therefore a step 3 decision, not a step 2 edit.**
+
+**The reward is informative about standing and nearly flat about getting up.**
+Per-step reward while upright (cos > 0.9) is 1.92 ± 0.05; while down
+(cos < 0.3) it is 0.12 ± 0.04. The level gap is 16x, so the *return* clearly
+prefers standing and the task is not degenerate. But `upright` is floored at 0
+past 90° and `height` is a 3 cm Gaussian worth ~1e−3 at floor level, so inside
+the fallen region the reward barely says which way is up. Expect exploration,
+not reward shape, to decide whether recovery is learned, and expect *fall
+slowly and stay tilted* as the competing local optimum.
+
+**`OBS_SCALE` is a guess and the measurement says it guessed wrong.** Group rms
+under random actions: `proj_grav` 0.577, `prev_action` 0.575, `gyro` 0.211,
+`joint_pos` 0.094, `joint_vel` 0.044. A 13x spread, with the 28 dims that
+describe the body's configuration carrying the least variance of all — so an
+unnormalised first layer attends mostly to the policy's own previous output.
+Step 3 needs a running observation normaliser rather than a better fixed guess.
+
 ## Scope, now that the gate has been measured
 
 - **In:** stand and recover from pushes, on `groundcontact`, ~50M env steps.
@@ -482,7 +559,7 @@ sim-to-sim transfer result meaningless while looking fine.
    drop tests. This README.
 2. **Environment contract — done.** 48-dim observation, 14-dim action, 50 Hz,
    fixed-length episodes with seeded pushes, hand-written multiprocess vector
-   env, 20 contract tests.
+   env, 27 contract tests.
 3. PPO against a PD hold-pose baseline, reusing the implementation from
    [ppo-from-scratch](https://github.com/AungKaung1928/ppo-from-scratch).
    Metric: recovery rate under randomised pushes, n=100, seeds reported.
@@ -507,12 +584,17 @@ sim-to-sim transfer result meaningless while looking fine.
   baseline to beat, not a distribution. The 108.9 ± 2.8 return is the
   distributional version of it, over 20 seeds, and that is the number step 3
   should be compared against.
-- The reward weights are chosen, not tuned. Nothing has optimised against them
-  yet, so they are a starting point and the first thing to suspect if step 3
-  learns something strange.
-- The environment is not validated by a policy learning in it. Twenty contract
-  tests say it does what it claims; they cannot say the task is learnable. That
-  is what step 3 is for.
+- The reward weights are chosen, not tuned, and now also measured. They are a
+  starting point and the first thing to suspect if step 3 learns something
+  strange.
+- The environment is not validated by a policy learning in it. Twenty-seven
+  contract tests say it does what it claims, and a review against the consumer
+  found five things the tests did not. Neither can say the task is learnable.
+  That is what step 3 is for.
+- The reward has still never had anything optimise against it. Three of its
+  four penalties are measurably inert and the fallen region is nearly flat;
+  both are written up above rather than quietly retuned, because changing
+  either invalidates the 108.7 baseline they would be measured against.
 - No observation noise, no domain randomisation, no actuator variation. The
   environment runs one nominal physics model. Step 4 adds the spread.
 - Earlier revisions of this README described every rate as measured against a
@@ -549,6 +631,14 @@ The benchmark is the only part that needs the machine to itself:
 nice -n 10 python3 bench.py --seconds 20 --ref-seconds 10 --tag main
 nice -n 10 python3 bench.py --sustained 8 --seconds 20 --windows 12 --tag sustained
 nice -n 10 python3 bench_wrapper.py --seconds 12        # 1 core, no load
+```
+
+Everything else is cheap and single-core:
+
+```bash
+python3 test_model.py     # the MJCF contract: variants, actuator order, classes
+python3 test_env.py       # 27 environment contract checks
+python3 baseline.py       # the PD baseline and the three step-3 risks
 ```
 
 Use the interpreter the virtual environment above provides. A bare `python` is
