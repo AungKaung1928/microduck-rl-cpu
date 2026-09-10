@@ -23,6 +23,8 @@ below, because the difference between them is the useful part.
 
 ---
 
+**Walkthrough:** https://aungkaung1928.github.io/projects/microduck-rl-cpu.html — the same project explained end to end, file by file.
+
 ## Step 1 — can this box simulate the duck fast enough?
 
 One **env step** is one 50 Hz control decision, which is 10 physics steps at the
